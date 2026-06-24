@@ -459,19 +459,42 @@ function getSectorInfo(symbol) {
 
 // ─── Data Fetching ────────────────────────────────────────────────────────────
 
+// In-memory cache: keyed by "SYMBOL:months", TTL 20 minutes
+// Prevents 429 rate-limit errors from Yahoo Finance on repeated scans
+const _dataCache = new Map();
+const DATA_CACHE_TTL = 20 * 60 * 1000; // 20 min
+
 async function fetchNSEData(symbol, months = 6) {
-  const startDate = new Date();
-  startDate.setMonth(startDate.getMonth() - months);
-  const result = await yf.chart(`${symbol}.NS`, {
-    period1: startDate.toISOString().split("T")[0],
-    interval: "1d"
-  });
-  const quotes = result?.quotes?.filter(d => d.close != null) || [];
-  return quotes.map(d => ({
-    date: d.date.toISOString().split("T")[0],
-    open: d.open, high: d.high, low: d.low,
-    close: d.close, volume: d.volume
-  }));
+  const key = `${symbol}:${months}`;
+  const cached = _dataCache.get(key);
+  if (cached && Date.now() < cached.expiry) return cached.data;
+
+  // Retry up to 3 times on 429 / network errors with exponential backoff
+  let lastErr;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      if (attempt > 0) await new Promise(r => setTimeout(r, 1000 * 2 ** attempt));
+      const startDate = new Date();
+      startDate.setMonth(startDate.getMonth() - months);
+      const result = await yf.chart(`${symbol}.NS`, {
+        period1: startDate.toISOString().split("T")[0],
+        interval: "1d"
+      });
+      const quotes = result?.quotes?.filter(d => d.close != null) || [];
+      const data = quotes.map(d => ({
+        date: d.date.toISOString().split("T")[0],
+        open: d.open, high: d.high, low: d.low,
+        close: d.close, volume: d.volume
+      }));
+      _dataCache.set(key, { data, expiry: Date.now() + DATA_CACHE_TTL });
+      return data;
+    } catch (err) {
+      lastErr = err;
+      const is429 = err?.message?.includes("429") || err?.status === 429;
+      if (!is429) break; // only retry on rate-limit
+    }
+  }
+  throw lastErr;
 }
 
 // ─── Volume Analysis ─────────────────────────────────────────────────────────
@@ -1071,7 +1094,7 @@ app.get("/api/scan", async (req, res) => {
       })
     );
     batchRes.forEach(r => { if (r.status === "fulfilled" && r.value) results.push(r.value); });
-    if (i + BATCH < stocks.length) await new Promise(r => setTimeout(r, 300));
+    if (i + BATCH < stocks.length) await new Promise(r => setTimeout(r, 600));
   }
 
   if (isCrossover) {
