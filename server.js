@@ -458,9 +458,9 @@ function getSectorInfo(symbol) {
 }
 
 // ─── Data Fetching ────────────────────────────────────────────────────────────
+// Uses Stooq (stooq.com) — free, no API key, no crumb, covers all NSE stocks.
+// Yahoo Finance (yahoo-finance2) is only used for Nifty intraday + global indices.
 
-// In-memory cache: keyed by "SYMBOL:months", TTL 20 minutes
-// Prevents 429 rate-limit errors from Yahoo Finance on repeated scans
 const _dataCache = new Map();
 const DATA_CACHE_TTL = 20 * 60 * 1000; // 20 min
 
@@ -469,29 +469,49 @@ async function fetchNSEData(symbol, months = 6) {
   const cached = _dataCache.get(key);
   if (cached && Date.now() < cached.expiry) return cached.data;
 
-  // Retry up to 3 times on 429 / network errors with exponential backoff
+  // Always fetch at least 14 months so EMA-50/RSI-14 have enough lookback
+  const lookback = Math.max(months, 14);
+  const end   = new Date();
+  const start = new Date();
+  start.setMonth(start.getMonth() - lookback);
+  const d1 = start.toISOString().slice(0, 10).replace(/-/g, "");
+  const d2 = end.toISOString().slice(0, 10).replace(/-/g, "");
+
+  const stooqSym = symbol.toLowerCase() + ".ns";
+  const url = `https://stooq.com/q/d/l/?s=${stooqSym}&d1=${d1}&d2=${d2}&i=d`;
+
   let lastErr;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      if (attempt > 0) await new Promise(r => setTimeout(r, 1000 * 2 ** attempt));
-      const startDate = new Date();
-      startDate.setMonth(startDate.getMonth() - months);
-      const result = await yf.chart(`${symbol}.NS`, {
-        period1: startDate.toISOString().split("T")[0],
-        interval: "1d"
+      if (attempt > 0) await new Promise(r => setTimeout(r, 1200 * attempt));
+      const res = await fetch(url, {
+        headers: { "User-Agent": "Mozilla/5.0 (compatible; StockBot/1.0)" }
       });
-      const quotes = result?.quotes?.filter(d => d.close != null) || [];
-      const data = quotes.map(d => ({
-        date: d.date.toISOString().split("T")[0],
-        open: d.open, high: d.high, low: d.low,
-        close: d.close, volume: d.volume
-      }));
+      if (!res.ok) throw new Error(`Stooq HTTP ${res.status}`);
+      const text = await res.text();
+      const lines = text.trim().split("\n");
+      if (lines.length < 3) throw new Error("No data from Stooq");
+
+      // Stooq CSV: Date,Open,High,Low,Close,Volume  (newest row first)
+      const data = lines.slice(1)
+        .map(line => {
+          const [date, open, high, low, close, volume] = line.split(",");
+          return {
+            date,
+            open:   parseFloat(open),
+            high:   parseFloat(high),
+            low:    parseFloat(low),
+            close:  parseFloat(close),
+            volume: parseInt(volume) || 0
+          };
+        })
+        .filter(d => d.close && !isNaN(d.close))
+        .sort((a, b) => a.date.localeCompare(b.date)); // sort oldest→newest
+
       _dataCache.set(key, { data, expiry: Date.now() + DATA_CACHE_TTL });
       return data;
     } catch (err) {
       lastErr = err;
-      const is429 = err?.message?.includes("429") || err?.status === 429;
-      if (!is429) break; // only retry on rate-limit
     }
   }
   throw lastErr;
@@ -949,29 +969,27 @@ function computeGlobalSentiment(indices) {
 // ─── API Routes ───────────────────────────────────────────────────────────────
 
 // Global indices + sentiment
+// Uses yahoo-finance2 (only ~14 symbols, not NSE stocks — much lower rate-limit risk)
 app.get("/api/global", async (req, res) => {
-  try {
-    const symbols  = GLOBAL_INDICES.map(i => i.symbol);
-    const quotes   = await Promise.allSettled(symbols.map(s => yf.quote(s)));
-    const indices  = GLOBAL_INDICES.map((meta, i) => {
-      const q = quotes[i].status === "fulfilled" ? quotes[i].value : null;
-      return {
-        ...meta,
-        price:     q?.regularMarketPrice      ?? null,
-        change:    q?.regularMarketChange     ?? null,
-        changePct: q?.regularMarketChangePercent != null
-                     ? +q.regularMarketChangePercent.toFixed(2)
-                     : null,
-        prevClose: q?.regularMarketPreviousClose ?? null,
-        isOpen:    q?.marketState === "REGULAR"
-      };
-    });
-
-    const sentiment = computeGlobalSentiment(indices);
-    res.json({ indices, sentiment, timestamp: new Date().toISOString() });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  const symbols = GLOBAL_INDICES.map(i => i.symbol);
+  const quotes  = await Promise.allSettled(symbols.map(s =>
+    yf.quote(s).catch(() => null)
+  ));
+  const indices = GLOBAL_INDICES.map((meta, i) => {
+    const q = quotes[i].status === "fulfilled" ? quotes[i].value : null;
+    return {
+      ...meta,
+      price:     q?.regularMarketPrice      ?? null,
+      change:    q?.regularMarketChange     ?? null,
+      changePct: q?.regularMarketChangePercent != null
+                   ? +q.regularMarketChangePercent.toFixed(2)
+                   : null,
+      prevClose: q?.regularMarketPreviousClose ?? null,
+      isOpen:    q?.marketState === "REGULAR"
+    };
+  });
+  const sentiment = computeGlobalSentiment(indices);
+  res.json({ indices, sentiment, timestamp: new Date().toISOString() });
 });
 
 // List available universes
@@ -992,7 +1010,16 @@ app.get("/api/stock/:symbol", async (req, res) => {
 
     const analysis = calcIndicators(data);
     const volume   = analyzeVolume(data);
-    const quote    = await yf.quote(`${symbol}.NS`);
+
+    // Derive price/change/52w from Stooq data (no live quote call needed)
+    const last     = data[data.length - 1];
+    const prev     = data[data.length - 2];
+    const price    = last.close;
+    const change   = prev ? +(price - prev.close).toFixed(2) : 0;
+    const changePct = prev ? +((price - prev.close) / prev.close * 100).toFixed(2) : 0;
+    const slice252  = data.slice(-252);
+    const high52w   = +Math.max(...slice252.map(d => d.high)).toFixed(2);
+    const low52w    = +Math.min(...slice252.map(d => d.low)).toFixed(2);
 
     // Volume signal feeds into overall signals
     if (volume.scenarioType === "bullish" && !analysis.signals.find(s => s.name === "Volume"))
@@ -1002,15 +1029,8 @@ app.get("/api/stock/:symbol", async (req, res) => {
 
     const sectorInfo = getSectorInfo(symbol);
     res.json({
-      symbol,
-      price:     quote.regularMarketPrice,
-      change:    quote.regularMarketChange?.toFixed(2),
-      changePct: quote.regularMarketChangePercent?.toFixed(2),
-      sectorInfo,
-      high52w:   quote.fiftyTwoWeekHigh,
-      low52w:    quote.fiftyTwoWeekLow,
-      volume,
-      ...analysis
+      symbol, price, change, changePct, sectorInfo, high52w, low52w,
+      volume, ...analysis
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
