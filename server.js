@@ -1,10 +1,8 @@
 import express from "express";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
-import YahooFinanceLib from "yahoo-finance2";
 import { EMA, RSI, MACD, BollingerBands, ATR, OBV } from "technicalindicators";
 
-const yf = new YahooFinanceLib({ suppressNotices: ["ripHistorical"] });
 const app = express();
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -517,6 +515,80 @@ async function fetchNSEData(symbol, months = 6) {
   throw lastErr;
 }
 
+// ─── Stooq Quotes for Global Indices ─────────────────────────────────────────
+// Maps Yahoo Finance symbols → Stooq symbols for global indices/commodities/FX.
+// Stooq needs no API key and has no crumb/cookie requirement.
+
+const STOOQ_MAP = {
+  "^GSPC":    "^spx",   "^DJI":     "^dji",   "^IXIC":    "^ndq",
+  "^N225":    "^nk225", "^HSI":     "^hsi",
+  "^FTSE":    "^ftse",  "^GDAXI":   "^dax",
+  "^NSEI":    "^nsei",  "^BSESN":   "^bsesn",
+  "^INDIAVIX": null,    // not on Stooq — filled via NSE allIndices
+  "BZ=F":     "co.f",   "GC=F":     "gc.f",
+  "USDINR=X": "usdinr", "DX-Y.NYB": "dxy.f"
+};
+
+const _quoteCache = new Map();
+const QUOTE_CACHE_TTL = 15 * 60 * 1000; // 15 min
+
+async function fetchStooqQuote(yahooSymbol) {
+  const sym = STOOQ_MAP[yahooSymbol];
+  if (!sym) return null;
+
+  const key = `sq:${sym}`;
+  const hit = _quoteCache.get(key);
+  if (hit && Date.now() < hit.expiry) return hit.data;
+
+  try {
+    const res  = await fetch(`https://stooq.com/q/d/l/?s=${sym}&i=d`, {
+      headers: { "User-Agent": "Mozilla/5.0 (compatible)" }
+    });
+    if (!res.ok) return null;
+    const text  = await res.text();
+    const lines = text.trim().split("\n");
+    if (lines.length < 3) return null;
+
+    // Stooq CSV is newest-first: lines[1]=today, lines[2]=yesterday
+    const parse = l => { const [d,,,,c] = l.split(","); return { date: d, price: parseFloat(c) }; };
+    const curr = parse(lines[1]);
+    const prev = parse(lines[2]);
+    if (!curr.price || !prev.price) return null;
+
+    const change    = +(curr.price - prev.price).toFixed(4);
+    const changePct = +((curr.price - prev.price) / prev.price * 100).toFixed(2);
+    const data = { price: curr.price, change, changePct, prevClose: prev.price };
+    _quoteCache.set(key, { data, expiry: Date.now() + QUOTE_CACHE_TTL });
+    return data;
+  } catch { return null; }
+}
+
+// Nifty 50 daily candles from Stooq (no Yahoo Finance needed)
+async function fetchNiftyDaily(months = 5) {
+  const key = `^nsei:daily:${months}`;
+  const hit = _dataCache.get(key);
+  if (hit && Date.now() < hit.expiry) return hit.data;
+
+  const start = new Date(); start.setMonth(start.getMonth() - months);
+  const d1 = start.toISOString().slice(0, 10).replace(/-/g, "");
+  const d2 = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+  try {
+    const res  = await fetch(`https://stooq.com/q/d/l/?s=^nsei&d1=${d1}&d2=${d2}&i=d`, {
+      headers: { "User-Agent": "Mozilla/5.0 (compatible)" }
+    });
+    if (!res.ok) return [];
+    const text  = await res.text();
+    const lines = text.trim().split("\n");
+    const data  = lines.slice(1)
+      .map(l => { const [date, open, high, low, close, volume] = l.split(",");
+        return { date, open: +open, high: +high, low: +low, close: +close, volume: +volume||0 }; })
+      .filter(d => d.close && !isNaN(d.close))
+      .sort((a, b) => a.date.localeCompare(b.date));
+    _dataCache.set(key, { data, expiry: Date.now() + DATA_CACHE_TTL });
+    return data;
+  } catch { return []; }
+}
+
 // ─── Volume Analysis ─────────────────────────────────────────────────────────
 
 function analyzeVolume(data) {
@@ -968,24 +1040,24 @@ function computeGlobalSentiment(indices) {
 
 // ─── API Routes ───────────────────────────────────────────────────────────────
 
-// Global indices + sentiment
-// Uses yahoo-finance2 (only ~14 symbols, not NSE stocks — much lower rate-limit risk)
+// Global indices + sentiment — sourced from Stooq (no API key, no crumb)
 app.get("/api/global", async (req, res) => {
-  const symbols = GLOBAL_INDICES.map(i => i.symbol);
-  const quotes  = await Promise.allSettled(symbols.map(s =>
-    yf.quote(s).catch(() => null)
-  ));
+  const [stooqResults, nseList] = await Promise.all([
+    Promise.all(GLOBAL_INDICES.map(m => fetchStooqQuote(m.symbol))),
+    fetchNSEIndices()
+  ]);
+  const vix = nseIndexQuote(nseList, "INDIA VIX");
+
   const indices = GLOBAL_INDICES.map((meta, i) => {
-    const q = quotes[i].status === "fulfilled" ? quotes[i].value : null;
+    let q = stooqResults[i];
+    if (meta.symbol === "^INDIAVIX") q = vix;  // Stooq has no India VIX — use NSE
     return {
       ...meta,
-      price:     q?.regularMarketPrice      ?? null,
-      change:    q?.regularMarketChange     ?? null,
-      changePct: q?.regularMarketChangePercent != null
-                   ? +q.regularMarketChangePercent.toFixed(2)
-                   : null,
-      prevClose: q?.regularMarketPreviousClose ?? null,
-      isOpen:    q?.marketState === "REGULAR"
+      price:     q?.price     ?? null,
+      change:    q?.change    ?? null,
+      changePct: q?.changePct ?? null,
+      prevClose: q?.prevClose ?? null,
+      isOpen:    null
     };
   });
   const sentiment = computeGlobalSentiment(indices);
@@ -1297,68 +1369,30 @@ function computeNiftySignal(dailyData, intradayData, globalSentiment) {
   };
 }
 
-// Nifty 15-min intraday candles
+// Nifty 15-min intraday — returns empty array (intraday needs Yahoo Finance which is rate-limited)
 app.get("/api/nifty/intraday", async (req, res) => {
-  try {
-    const startDate = new Date();
-    startDate.setDate(startDate.getDate() - 2);
-    const result = await yf.chart("^NSEI", {
-      period1: startDate.toISOString().split("T")[0],
-      interval: "15m"
-    });
-    const quotes = (result?.quotes || []).filter(d => d.close != null);
-    const today = new Date().toISOString().split("T")[0];
-    const todayQ = quotes.filter(d => new Date(d.date).toISOString().split("T")[0] === today);
-    const candles = (todayQ.length >= 3 ? todayQ : quotes.slice(-26)).map(d => ({
-      date: d.date.toISOString(), open: +d.open.toFixed(2), high: +d.high.toFixed(2),
-      low: +d.low.toFixed(2), close: +d.close.toFixed(2), volume: d.volume
-    }));
-    res.json(candles);
-  } catch(err) {
-    res.status(500).json({ error: err.message });
-  }
+  res.json([]);
 });
 
-// Full Nifty signal (daily + intraday + global → option signal)
+// Full Nifty signal — daily from Stooq, globals from Stooq + NSE, intraday disabled
 app.get("/api/nifty/signal", async (req, res) => {
   try {
-    const startDate = new Date();
-    startDate.setDate(startDate.getDate() - 120);
-    const intStart = new Date();
-    intStart.setDate(intStart.getDate() - 2);
-
-    const [dailyRes, intradayRes, globalRes] = await Promise.allSettled([
-      yf.chart("^NSEI", { period1: startDate.toISOString().split("T")[0], interval: "1d" }),
-      yf.chart("^NSEI", { period1: intStart.toISOString().split("T")[0], interval: "15m" }),
-      Promise.allSettled(GLOBAL_INDICES.map(i => yf.quote(i.symbol)))
+    const [dailyData, stooqGlobals, nseList] = await Promise.all([
+      fetchNiftyDaily(5),
+      Promise.all(GLOBAL_INDICES.map(m => fetchStooqQuote(m.symbol))),
+      fetchNSEIndices()
     ]);
+    const vix = nseIndexQuote(nseList, "INDIA VIX");
 
-    const dailyData = (dailyRes.value?.quotes || []).filter(d => d.close != null).map(d => ({
-      date: d.date.toISOString().split("T")[0],
-      open: +d.open.toFixed(2), high: +d.high.toFixed(2),
-      low:  +d.low.toFixed(2),  close: +d.close.toFixed(2), volume: d.volume
-    }));
-
-    const today = new Date().toISOString().split("T")[0];
-    const allInt = (intradayRes.value?.quotes || []).filter(d => d.close != null);
-    const todayInt = allInt.filter(d => new Date(d.date).toISOString().split("T")[0] === today);
-    const intradayData = (todayInt.length >= 3 ? todayInt : allInt.slice(-26)).map(d => ({
-      date: d.date.toISOString(), open: +d.open.toFixed(2), high: +d.high.toFixed(2),
-      low: +d.low.toFixed(2), close: +d.close.toFixed(2), volume: d.volume
-    }));
-
-    const gQuotes = globalRes.value || [];
-    const indices  = GLOBAL_INDICES.map((meta, i) => {
-      const q = gQuotes[i]?.status === "fulfilled" ? gQuotes[i].value : null;
-      return { ...meta, price: q?.regularMarketPrice ?? null,
-        change: q?.regularMarketChange ?? null,
-        changePct: q?.regularMarketChangePercent != null ? +q.regularMarketChangePercent.toFixed(2) : null };
+    const indices = GLOBAL_INDICES.map((meta, i) => {
+      let q = stooqGlobals[i];
+      if (meta.symbol === "^INDIAVIX") q = vix;
+      return { ...meta, price: q?.price ?? null, change: q?.change ?? null, changePct: q?.changePct ?? null };
     });
     const globalSentiment = computeGlobalSentiment(indices);
+    const signal = computeNiftySignal(dailyData, [], globalSentiment);
 
-    const signal = computeNiftySignal(dailyData, intradayData, globalSentiment);
-
-    res.json({ signal, intraday: intradayData, globalIndices: indices, globalSentiment, timestamp: new Date().toISOString() });
+    res.json({ signal, intraday: [], globalIndices: indices, globalSentiment, timestamp: new Date().toISOString() });
   } catch(err) {
     res.status(500).json({ error: err.message });
   }
@@ -1385,6 +1419,35 @@ async function getNSECookies() {
     _nseSession = { cookies, expiry: Date.now() + 4 * 60 * 1000 };
     return cookies;
   } catch { return ""; }
+}
+
+// NSE allIndices — gives live Nifty 50, SENSEX, India VIX, etc.
+let _nseIdxCache = { data: null, expiry: 0 };
+
+async function fetchNSEIndices() {
+  if (_nseIdxCache.data && Date.now() < _nseIdxCache.expiry) return _nseIdxCache.data;
+  try {
+    const cookies = await getNSECookies();
+    const res = await fetch("https://www.nseindia.com/api/allIndices", {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Referer": "https://www.nseindia.com/",
+        ...(cookies ? { Cookie: cookies } : {})
+      }
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    const list = json?.data || [];
+    _nseIdxCache = { data: list, expiry: Date.now() + 60_000 }; // 1 min
+    return list;
+  } catch { return null; }
+}
+
+function nseIndexQuote(list, indexName) {
+  const row = list?.find(r => r.index === indexName);
+  if (!row) return null;
+  return { price: row.last, change: row.variation, changePct: row.percentChange };
 }
 
 function bsPrice(S, K, T, r, sigma, type) {
@@ -1493,10 +1556,12 @@ app.get("/api/nifty/option-chain", async (req, res) => {
     // Fallback: synthetic chain from B-S
   }
   try {
-    const [spotQ, vixQ] = await Promise.all([yf.quote("^NSEI"), yf.quote("^INDIAVIX")]);
-    const spot = spotQ.regularMarketPrice;
-    const vix  = vixQ.regularMarketPrice;
-    const startDate = new Date(); startDate.setDate(startDate.getDate() - 90);
+    // Fallback: use NSE allIndices for spot + VIX, then B-S synthetic chain
+    const nseList = await fetchNSEIndices();
+    const niftyRow = nseIndexQuote(nseList, "NIFTY 50");
+    const vixRow   = nseIndexQuote(nseList, "INDIA VIX");
+    const spot = niftyRow?.price ?? 24000;
+    const vix  = vixRow?.price  ?? 15;
     const chain = syntheticChain(spot, vix, 4);
     const totalCEOI = chain.reduce((s,r) => s+(r.CE?.oi||0),0);
     const totalPEOI = chain.reduce((s,r) => s+(r.PE?.oi||0),0);
@@ -1514,18 +1579,18 @@ app.get("/api/nifty/option-chain", async (req, res) => {
   }
 });
 
-// Live Nifty spot + VIX for P&L refresh
+// Live Nifty spot + VIX — sourced from NSE allIndices (no Yahoo Finance)
 app.get("/api/nifty/live", async (req, res) => {
   try {
-    const [spotQ, vixQ] = await Promise.all([
-      yf.quote("^NSEI"),
-      yf.quote("^INDIAVIX")
-    ]);
+    const nseList = await fetchNSEIndices();
+    const nifty   = nseIndexQuote(nseList, "NIFTY 50");
+    const vix     = nseIndexQuote(nseList, "INDIA VIX");
+    if (!nifty) return res.status(503).json({ error: "NSE data unavailable" });
     res.json({
-      spot:      +spotQ.regularMarketPrice.toFixed(2),
-      spotChg:   +spotQ.regularMarketChangePercent.toFixed(2),
-      vix:       +vixQ.regularMarketPrice.toFixed(2),
-      vixChg:    +vixQ.regularMarketChangePercent.toFixed(2),
+      spot:      nifty.price,
+      spotChg:   nifty.changePct,
+      vix:       vix?.price   ?? null,
+      vixChg:    vix?.changePct ?? null,
       timestamp: new Date().toISOString()
     });
   } catch(err) {
