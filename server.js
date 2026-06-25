@@ -564,6 +564,33 @@ async function ensureBhavMap() {
   await _bhavBuild;
 }
 
+// ─── Yahoo v8 Historical (fast path, no crumb) ───────────────────────────────
+
+async function fetchYahooHistorical(symbol, months) {
+  try {
+    const range = months <= 3 ? "3mo" : months <= 6 ? "6mo" : months <= 12 ? "1y" : "2y";
+    const url   = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}.NS?interval=1d&range=${range}`;
+    const res   = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36" } });
+    if (!res.ok) return null;
+    const json   = await res.json();
+    const result = json?.chart?.result?.[0];
+    if (!result?.timestamp?.length) return null;
+    const ohlcv = result.indicators?.quote?.[0];
+    if (!ohlcv) return null;
+    return result.timestamp
+      .map((ts, i) => ({
+        date:   new Date(ts * 1000).toISOString().slice(0, 10),
+        open:   ohlcv.open[i]   || 0,
+        high:   ohlcv.high[i]   || 0,
+        low:    ohlcv.low[i]    || 0,
+        close:  ohlcv.close[i]  || 0,
+        volume: ohlcv.volume[i] || 0
+      }))
+      .filter(d => d.close > 0)
+      .sort((a, b) => a.date.localeCompare(b.date));
+  } catch { return null; }
+}
+
 // ─── Data Fetching ────────────────────────────────────────────────────────────
 
 async function fetchNSEData(symbol, months = 6) {
@@ -571,9 +598,22 @@ async function fetchNSEData(symbol, months = 6) {
   const cached = _dataCache.get(key);
   if (cached && Date.now() < cached.expiry) return cached.data;
 
-  await ensureBhavMap();
-  const data = _bhavMap?.get(symbol) || [];
-  _dataCache.set(key, { data, expiry: Date.now() + DATA_CACHE_TTL });
+  // Fast path: Yahoo v8 chart historical (no crumb, no cache build wait)
+  const lookback = Math.max(months, 14);
+  let data = await fetchYahooHistorical(symbol, lookback);
+
+  // Fallback: bhavcopy in-memory cache (if Yahoo is blocked on this IP)
+  if (!data || data.length < 30) {
+    if (_bhavMap) {
+      data = _bhavMap.get(symbol) || [];
+    } else {
+      ensureBhavMap().catch(() => {}); // trigger background build
+      data = [];
+    }
+  }
+
+  if (data.length > 0)
+    _dataCache.set(key, { data, expiry: Date.now() + DATA_CACHE_TTL });
   return data;
 }
 
@@ -1807,5 +1847,5 @@ app.get("/api/live/quotes", async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Stock Dashboard → http://localhost:${PORT}`);
-  buildBhavMap(14).catch(e => console.error("[bhavcopy] startup build failed:", e));
+  ensureBhavMap().catch(e => console.error("[bhavcopy] startup build failed:", e));
 });
