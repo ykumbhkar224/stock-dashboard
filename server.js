@@ -515,7 +515,7 @@ async function buildBhavMap(months = 14) {
   const map  = new Map();
   const dates = tradingDateStrings(months);
 
-  const BATCH = 8;
+  const BATCH = 12;
   for (let i = 0; i < dates.length; i += BATCH) {
     const batch = dates.slice(i, i + BATCH);
     const csvs  = await Promise.allSettled(batch.map(fetchOneBhavcopy));
@@ -548,7 +548,7 @@ async function buildBhavMap(months = 14) {
         });
       }
     }
-    if (i + BATCH < dates.length) await new Promise(r => setTimeout(r, 150));
+    if (i + BATCH < dates.length) await new Promise(r => setTimeout(r, 50));
   }
 
   // Sort each series oldest → newest
@@ -598,20 +598,19 @@ async function fetchNSEData(symbol, months = 6) {
   const cached = _dataCache.get(key);
   if (cached && Date.now() < cached.expiry) return cached.data;
 
-  // Fast path: Yahoo v8 chart historical (no crumb, no cache build wait)
   const lookback = Math.max(months, 14);
-  let data = await fetchYahooHistorical(symbol, lookback);
 
-  // Fallback: bhavcopy in-memory cache (if Yahoo is blocked on this IP)
-  if (!data || data.length < 30) {
-    if (_bhavMap) {
-      data = _bhavMap.get(symbol) || [];
-    } else {
-      ensureBhavMap().catch(() => {}); // trigger background build
-      data = [];
-    }
+  // Fast path: Yahoo v8 (no crumb, instant if not IP-blocked)
+  const yahooData = await fetchYahooHistorical(symbol, lookback);
+  if (yahooData && yahooData.length >= 30) {
+    _dataCache.set(key, { data: yahooData, expiry: Date.now() + DATA_CACHE_TTL });
+    return yahooData;
   }
 
+  // Bhavcopy fallback — wait for the build that started at server startup
+  // (builds in ~15s on cold start with batch=12/delay=50ms; well under 30s timeout)
+  await ensureBhavMap();
+  const data = _bhavMap?.get(symbol) || [];
   if (data.length > 0)
     _dataCache.set(key, { data, expiry: Date.now() + DATA_CACHE_TTL });
   return data;
