@@ -1707,31 +1707,35 @@ app.get("/api/nifty/live", async (req, res) => {
 });
 
 // ─── Live Quote (Intraday) ───────────────────────────────────────────────────
-// Primary:  Twelve Data API (key in TWELVE_DATA_KEY env var, free 800 calls/day)
-// Fallback: NSE quote-equity endpoint (no key, uses session cookie)
-// Cache:    5 minutes per symbol so we don't burn rate limits
+// Primary:  Yahoo Finance v8 chart endpoint — reads the `meta` block which
+//           contains regularMarketPrice/High/Low/Volume WITHOUT needing a crumb.
+//           This is different from the crumb-gated endpoints that 429 on Render.
+// Fallback: NSE quote-equity endpoint (session cookie based)
+// Cache:    5 minutes per symbol
 
-const TWELVE_KEY = process.env.TWELVE_DATA_KEY || "";
-const LIVE_CACHE_TTL = 5 * 60 * 1000; // 5 min
+const LIVE_CACHE_TTL = 5 * 60 * 1000;
 
-async function fetchTwelveDataQuote(symbol) {
-  if (!TWELVE_KEY) return null;
+async function fetchYahooLiveQuote(symbol) {
   try {
-    const url  = `https://api.twelvedata.com/quote?symbol=${encodeURIComponent(symbol)}:NSE&apikey=${TWELVE_KEY}`;
-    const res  = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (compatible)" } });
+    const url  = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}.NS?interval=1d&range=1d`;
+    const res  = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36" } });
+    if (!res.ok) return null;
     const json = await res.json();
-    if (json.status === "error" || !json.close) return null;
+    const meta = json?.chart?.result?.[0]?.meta;
+    if (!meta || !meta.regularMarketPrice) return null;
+    const price     = meta.regularMarketPrice;
+    const prevClose = meta.chartPreviousClose || meta.previousClose || 0;
     return {
-      price:     parseFloat(json.close),
-      open:      parseFloat(json.open),
-      high:      parseFloat(json.high),
-      low:       parseFloat(json.low),
-      change:    parseFloat(json.change),
-      changePct: parseFloat(json.percent_change),
-      prevClose: parseFloat(json.previous_close),
-      volume:    parseInt(json.volume) || 0,
-      isMarketOpen: !!json.is_market_open,
-      source:    "twelvedata"
+      price,
+      open:      meta.regularMarketOpen      || prevClose,
+      high:      meta.regularMarketDayHigh   || price,
+      low:       meta.regularMarketDayLow    || price,
+      change:    prevClose ? +(price - prevClose).toFixed(2) : 0,
+      changePct: prevClose ? +((price - prevClose) / prevClose * 100).toFixed(2) : 0,
+      prevClose,
+      volume:    meta.regularMarketVolume    || 0,
+      isMarketOpen: meta.marketState === "REGULAR",
+      source:    "yahoo-v8"
     };
   } catch { return null; }
 }
@@ -1775,7 +1779,7 @@ async function fetchLiveQuote(symbol) {
   const hit = _quoteCache.get(key);
   if (hit && Date.now() < hit.expiry) return hit.data;
 
-  const data = await fetchTwelveDataQuote(symbol) || await fetchNSEEquityQuote(symbol);
+  const data = await fetchYahooLiveQuote(symbol) || await fetchNSEEquityQuote(symbol);
   if (data) _quoteCache.set(key, { data, expiry: Date.now() + LIVE_CACHE_TTL });
   return data;
 }
