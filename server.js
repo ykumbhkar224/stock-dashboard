@@ -1,6 +1,8 @@
 import express from "express";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
+import { createHash } from "crypto";
+import { inflateRawSync } from "zlib";
 import { EMA, RSI, MACD, BollingerBands, ATR, OBV } from "technicalindicators";
 
 const app = express();
@@ -456,132 +458,227 @@ function getSectorInfo(symbol) {
 }
 
 // ─── Data Fetching ────────────────────────────────────────────────────────────
-// Uses Stooq (stooq.com) — free, no API key, no crumb, covers all NSE stocks.
-// Yahoo Finance (yahoo-finance2) is only used for Nifty intraday + global indices.
+// ─── NSE Bhavcopy Data Source ─────────────────────────────────────────────────
+// NSE publishes daily bhavcopy CSV files publicly (no auth, no rate limit).
+// URL: https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_YYYYMMDD_F_0000.csv.zip
+// We download ~14 months of files, parse them with built-in zlib, and cache
+// all stock data in memory. Background-built on server startup.
 
-const _dataCache = new Map();
-const DATA_CACHE_TTL = 20 * 60 * 1000; // 20 min
+const _dataCache  = new Map();
+const DATA_CACHE_TTL  = 4 * 60 * 60 * 1000; // 4 hours
+const _quoteCache = new Map();
+const QUOTE_CACHE_TTL = 15 * 60 * 1000;
+
+let _bhavMap   = null; // Map<symbol, [{date,open,high,low,close,volume}]>
+let _bhavDate  = null; // ISO date string cache was built for
+let _bhavBuild = null; // in-flight promise
+
+function parseBhavZip(buf) {
+  // Single-entry ZIP: local file header at offset 0
+  const fnLen    = buf.readUInt16LE(26);
+  const extraLen = buf.readUInt16LE(28);
+  const compSize = buf.readUInt32LE(18);
+  const start    = 30 + fnLen + extraLen;
+  return inflateRawSync(buf.slice(start, start + compSize)).toString("utf-8");
+}
+
+async function fetchOneBhavcopy(yyyymmdd) {
+  const url = `https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_${yyyymmdd}_F_0000.csv.zip`;
+  const res  = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (compatible)" } });
+  if (res.status !== 200) return null;
+  const buf  = Buffer.from(await res.arrayBuffer());
+  return parseBhavZip(buf);
+}
+
+function tradingDateStrings(months) {
+  const out = [], end = new Date(), cur = new Date();
+  cur.setMonth(cur.getMonth() - months);
+  while (cur <= end) {
+    const d = cur.getDay();
+    if (d !== 0 && d !== 6) { // skip weekends
+      const y  = cur.getFullYear();
+      const mo = String(cur.getMonth() + 1).padStart(2, "0");
+      const dy = String(cur.getDate()).padStart(2, "0");
+      out.push(`${y}${mo}${dy}`);
+    }
+    cur.setDate(cur.getDate() + 1);
+  }
+  return out;
+}
+
+async function buildBhavMap(months = 14) {
+  const today = new Date().toISOString().slice(0, 10);
+  if (_bhavMap && _bhavDate === today) return;
+
+  console.log("[bhavcopy] Building data cache...");
+  const ALL = new Set([...NIFTY50, ...NIFTY_NEXT50, ...NIFTY_MIDCAP, ...MULTIBAGGER, ...SMALL_CAP_UNIVERSE]);
+  const map  = new Map();
+  const dates = tradingDateStrings(months);
+
+  const BATCH = 8;
+  for (let i = 0; i < dates.length; i += BATCH) {
+    const batch = dates.slice(i, i + BATCH);
+    const csvs  = await Promise.allSettled(batch.map(fetchOneBhavcopy));
+    for (let j = 0; j < csvs.length; j++) {
+      if (csvs[j].status !== "fulfilled" || !csvs[j].value) continue;
+      const csv   = csvs[j].value;
+      const lines = csv.trim().split("\n");
+      const hdr   = lines[0].split(",");
+      const iSym  = hdr.indexOf("TckrSymb"),  iSer  = hdr.indexOf("SctySrs");
+      const iDate = hdr.indexOf("TradDt"),     iOpen = hdr.indexOf("OpnPric");
+      const iHigh = hdr.indexOf("HghPric"),    iLow  = hdr.indexOf("LwPric");
+      const iCls  = hdr.indexOf("ClsPric"),    iVol  = hdr.indexOf("TtlTradgVol");
+      if (iSym < 0 || iCls < 0) continue;
+
+      for (let k = 1; k < lines.length; k++) {
+        const cols = lines[k].split(",");
+        if (cols[iSer]?.trim() !== "EQ") continue;
+        const sym = cols[iSym]?.trim();
+        if (!sym || !ALL.has(sym)) continue;
+        const close = parseFloat(cols[iCls]);
+        if (!close || isNaN(close)) continue;
+        if (!map.has(sym)) map.set(sym, []);
+        map.get(sym).push({
+          date:   cols[iDate]?.trim()      || batch[j],
+          open:   parseFloat(cols[iOpen])  || close,
+          high:   parseFloat(cols[iHigh])  || close,
+          low:    parseFloat(cols[iLow])   || close,
+          close,
+          volume: parseInt(cols[iVol])     || 0
+        });
+      }
+    }
+    if (i + BATCH < dates.length) await new Promise(r => setTimeout(r, 150));
+  }
+
+  // Sort each series oldest → newest
+  for (const [sym, arr] of map) map.set(sym, arr.sort((a, b) => a.date.localeCompare(b.date)));
+  _bhavMap  = map;
+  _bhavDate = today;
+  console.log(`[bhavcopy] Done — ${map.size} symbols, ${dates.length} dates`);
+}
+
+async function ensureBhavMap() {
+  if (_bhavMap && _bhavDate === new Date().toISOString().slice(0, 10)) return;
+  if (!_bhavBuild) _bhavBuild = buildBhavMap(14).finally(() => { _bhavBuild = null; });
+  await _bhavBuild;
+}
+
+// ─── Data Fetching ────────────────────────────────────────────────────────────
 
 async function fetchNSEData(symbol, months = 6) {
   const key = `${symbol}:${months}`;
   const cached = _dataCache.get(key);
   if (cached && Date.now() < cached.expiry) return cached.data;
 
-  // Always fetch at least 14 months so EMA-50/RSI-14 have enough lookback
-  const lookback = Math.max(months, 14);
-  const end   = new Date();
-  const start = new Date();
-  start.setMonth(start.getMonth() - lookback);
-  const d1 = start.toISOString().slice(0, 10).replace(/-/g, "");
-  const d2 = end.toISOString().slice(0, 10).replace(/-/g, "");
-
-  const stooqSym = symbol.toLowerCase() + ".ns";
-  const url = `https://stooq.com/q/d/l/?s=${stooqSym}&d1=${d1}&d2=${d2}&i=d`;
-
-  let lastErr;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      if (attempt > 0) await new Promise(r => setTimeout(r, 1200 * attempt));
-      const res = await fetch(url, {
-        headers: { "User-Agent": "Mozilla/5.0 (compatible; StockBot/1.0)" }
-      });
-      if (!res.ok) throw new Error(`Stooq HTTP ${res.status}`);
-      const text = await res.text();
-      const lines = text.trim().split("\n");
-      if (lines.length < 3) throw new Error("No data from Stooq");
-
-      // Stooq CSV: Date,Open,High,Low,Close,Volume  (newest row first)
-      const data = lines.slice(1)
-        .map(line => {
-          const [date, open, high, low, close, volume] = line.split(",");
-          return {
-            date,
-            open:   parseFloat(open),
-            high:   parseFloat(high),
-            low:    parseFloat(low),
-            close:  parseFloat(close),
-            volume: parseInt(volume) || 0
-          };
-        })
-        .filter(d => d.close && !isNaN(d.close))
-        .sort((a, b) => a.date.localeCompare(b.date)); // sort oldest→newest
-
-      _dataCache.set(key, { data, expiry: Date.now() + DATA_CACHE_TTL });
-      return data;
-    } catch (err) {
-      lastErr = err;
-    }
-  }
-  throw lastErr;
+  await ensureBhavMap();
+  const data = _bhavMap?.get(symbol) || [];
+  _dataCache.set(key, { data, expiry: Date.now() + DATA_CACHE_TTL });
+  return data;
 }
 
 // ─── Stooq Quotes for Global Indices ─────────────────────────────────────────
-// Maps Yahoo Finance symbols → Stooq symbols for global indices/commodities/FX.
-// Stooq needs no API key and has no crumb/cookie requirement.
+// Bhavcopy only covers NSE equity. For global indices we use Stooq
+// (or NSE allIndices for India VIX). Stooq may serve a JS PoW challenge;
+// we solve it synchronously with createHash (d=4 ≈ 1 ms).
+
+const STOOQ_HDR = {
+  "User-Agent":      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.9",
+};
+let _stooqSession = { cookies: "", expiry: 0 };
+
+function solvePoW(c, d) {
+  const prefix = "0".repeat(d);
+  for (let n = 0; ; n++)
+    if (createHash("sha256").update(c + n).digest("hex").startsWith(prefix)) return n;
+}
+
+async function getStooqCookies() {
+  if (_stooqSession.cookies && Date.now() < _stooqSession.expiry) return _stooqSession.cookies;
+  const probe = await fetch("https://stooq.com/q/d/l/?s=%5Espx&i=d", { headers: STOOQ_HDR });
+  const pc    = (probe.headers.getSetCookie?.() || []).map(c => c.split(";")[0]).join("; ");
+  if (!(probe.headers.get("content-type") || "").includes("html")) {
+    _stooqSession = { cookies: pc, expiry: Date.now() + 2 * 3600_000 };
+    return pc;
+  }
+  const html = await probe.text();
+  const m    = html.match(/c="([^"]+)",d=(\d+)/);
+  if (!m) { _stooqSession = { cookies: pc, expiry: Date.now() + 3600_000 }; return pc; }
+  const n   = solvePoW(m[1], +m[2]);
+  const ver = await fetch("https://stooq.com/__verify", {
+    method: "POST",
+    headers: { ...STOOQ_HDR, "Content-Type": "application/x-www-form-urlencoded",
+               "Referer": "https://stooq.com/", ...(pc ? { Cookie: pc } : {}) },
+    body: `c=${encodeURIComponent(m[1])}&n=${n}`
+  });
+  const vc  = (ver.headers.getSetCookie?.() || []).map(c => c.split(";")[0]).join("; ");
+  const all = [pc, vc].filter(Boolean).join("; ");
+  _stooqSession = { cookies: all, expiry: Date.now() + 2 * 3600_000 };
+  return all;
+}
+
+async function fetchStooqCSV(url) {
+  const cookies = await getStooqCookies();
+  const res  = await fetch(url, { headers: { ...STOOQ_HDR, ...(cookies ? { Cookie: cookies } : {}) } });
+  if (!res.ok) throw new Error(`Stooq ${res.status}`);
+  const text = await res.text();
+  if (text.trimStart().startsWith("<")) { // challenge again — retry once
+    _stooqSession = { cookies: "", expiry: 0 };
+    const c2  = await getStooqCookies();
+    const r2  = await fetch(url, { headers: { ...STOOQ_HDR, ...(c2 ? { Cookie: c2 } : {}) } });
+    return r2.text();
+  }
+  return text;
+}
 
 const STOOQ_MAP = {
-  "^GSPC":    "^spx",   "^DJI":     "^dji",   "^IXIC":    "^ndq",
-  "^N225":    "^nk225", "^HSI":     "^hsi",
-  "^FTSE":    "^ftse",  "^GDAXI":   "^dax",
-  "^NSEI":    "^nsei",  "^BSESN":   "^bsesn",
-  "^INDIAVIX": null,    // not on Stooq — filled via NSE allIndices
-  "BZ=F":     "co.f",   "GC=F":     "gc.f",
-  "USDINR=X": "usdinr", "DX-Y.NYB": "dxy.f"
+  "^GSPC":     "^spx",   "^DJI":     "^dji",   "^IXIC":    "^ndq",
+  "^N225":     "^nk225", "^HSI":     "^hsi",
+  "^FTSE":     "^ftse",  "^GDAXI":   "^dax",
+  "^NSEI":     "^nsei",  "^BSESN":   "^bsesn",
+  "^INDIAVIX": null,
+  "BZ=F":      "co.f",   "GC=F":     "gc.f",
+  "USDINR=X":  "usdinr", "DX-Y.NYB": "dxy.f"
 };
-
-const _quoteCache = new Map();
-const QUOTE_CACHE_TTL = 15 * 60 * 1000; // 15 min
 
 async function fetchStooqQuote(yahooSymbol) {
   const sym = STOOQ_MAP[yahooSymbol];
   if (!sym) return null;
-
   const key = `sq:${sym}`;
   const hit = _quoteCache.get(key);
   if (hit && Date.now() < hit.expiry) return hit.data;
-
   try {
-    const res  = await fetch(`https://stooq.com/q/d/l/?s=${sym}&i=d`, {
-      headers: { "User-Agent": "Mozilla/5.0 (compatible)" }
-    });
-    if (!res.ok) return null;
-    const text  = await res.text();
+    const text  = await fetchStooqCSV(`https://stooq.com/q/d/l/?s=${encodeURIComponent(sym)}&i=d`);
     const lines = text.trim().split("\n");
     if (lines.length < 3) return null;
-
-    // Stooq CSV is newest-first: lines[1]=today, lines[2]=yesterday
-    const parse = l => { const [d,,,,c] = l.split(","); return { date: d, price: parseFloat(c) }; };
-    const curr = parse(lines[1]);
-    const prev = parse(lines[2]);
-    if (!curr.price || !prev.price) return null;
-
-    const change    = +(curr.price - prev.price).toFixed(4);
-    const changePct = +((curr.price - prev.price) / prev.price * 100).toFixed(2);
-    const data = { price: curr.price, change, changePct, prevClose: prev.price };
+    const p = l => parseFloat(l.split(",")[4]);
+    const curr = p(lines[1]), prev = p(lines[2]);
+    if (!curr || !prev) return null;
+    const data = { price: curr, change: +(curr-prev).toFixed(4), changePct: +((curr-prev)/prev*100).toFixed(2), prevClose: prev };
     _quoteCache.set(key, { data, expiry: Date.now() + QUOTE_CACHE_TTL });
     return data;
   } catch { return null; }
 }
 
-// Nifty 50 daily candles from Stooq (no Yahoo Finance needed)
+// Nifty 50 daily from bhavcopy (Nifty index itself is in NSE bhavcopy as underlying)
+// For the Nifty signal we use the NSE allIndices + bhavcopy for the series
 async function fetchNiftyDaily(months = 5) {
   const key = `^nsei:daily:${months}`;
   const hit = _dataCache.get(key);
   if (hit && Date.now() < hit.expiry) return hit.data;
-
-  const start = new Date(); start.setMonth(start.getMonth() - months);
-  const d1 = start.toISOString().slice(0, 10).replace(/-/g, "");
-  const d2 = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+  // Nifty 50 index OHLCV is not in the CM bhavcopy (equities only).
+  // Fall back to Stooq for the Nifty index series.
   try {
-    const res  = await fetch(`https://stooq.com/q/d/l/?s=^nsei&d1=${d1}&d2=${d2}&i=d`, {
-      headers: { "User-Agent": "Mozilla/5.0 (compatible)" }
-    });
-    if (!res.ok) return [];
-    const text  = await res.text();
+    const start = new Date(); start.setMonth(start.getMonth() - months);
+    const d1  = start.toISOString().slice(0, 10).replace(/-/g, "");
+    const d2  = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+    const text = await fetchStooqCSV(`https://stooq.com/q/d/l/?s=%5Ensei&d1=${d1}&d2=${d2}&i=d`);
     const lines = text.trim().split("\n");
     const data  = lines.slice(1)
       .map(l => { const [date, open, high, low, close, volume] = l.split(",");
-        return { date, open: +open, high: +high, low: +low, close: +close, volume: +volume||0 }; })
+        return { date, open: +open, high: +high, low: +low, close: +close, volume: +volume || 0 }; })
       .filter(d => d.close && !isNaN(d.close))
       .sort((a, b) => a.date.localeCompare(b.date));
     _dataCache.set(key, { data, expiry: Date.now() + DATA_CACHE_TTL });
@@ -1071,27 +1168,36 @@ app.get("/api/universes", (req, res) => {
   })));
 });
 
-// Single stock analysis (now includes volume)
+// Single stock analysis (now includes volume + live quote overlay)
 app.get("/api/stock/:symbol", async (req, res) => {
   try {
     const symbol = req.params.symbol.toUpperCase().replace(/\.NS$/i, "");
     const months = parseInt(req.query.months || "6");
-    const data   = await fetchNSEData(symbol, months);
+
+    // Fetch historical series and live quote in parallel
+    const [data, liveQuote] = await Promise.all([
+      fetchNSEData(symbol, months),
+      fetchLiveQuote(symbol)
+    ]);
+
     if (!data || data.length < 30)
       return res.status(404).json({ error: `No data found for ${symbol}` });
 
     const analysis = calcIndicators(data);
     const volume   = analyzeVolume(data);
 
-    // Derive price/change/52w from Stooq data (no live quote call needed)
-    const last     = data[data.length - 1];
-    const prev     = data[data.length - 2];
-    const price    = last.close;
-    const change   = prev ? +(price - prev.close).toFixed(2) : 0;
-    const changePct = prev ? +((price - prev.close) / prev.close * 100).toFixed(2) : 0;
-    const slice252  = data.slice(-252);
-    const high52w   = +Math.max(...slice252.map(d => d.high)).toFixed(2);
-    const low52w    = +Math.min(...slice252.map(d => d.low)).toFixed(2);
+    // Price: live quote if available, else last bhavcopy close
+    const last       = data[data.length - 1];
+    const prev       = data[data.length - 2];
+    const price      = liveQuote?.price     ?? last.close;
+    const change     = liveQuote?.change    ?? (prev ? +(price - prev.close).toFixed(2) : 0);
+    const changePct  = liveQuote?.changePct ?? (prev ? +((price - prev.close) / prev.close * 100).toFixed(2) : 0);
+    const todayOpen  = liveQuote?.open      ?? last.open;
+    const todayHigh  = liveQuote?.high      ?? last.high;
+    const todayLow   = liveQuote?.low       ?? last.low;
+    const slice252   = data.slice(-252);
+    const high52w    = +Math.max(...slice252.map(d => d.high), todayHigh).toFixed(2);
+    const low52w     = +Math.min(...slice252.map(d => d.low),  todayLow).toFixed(2);
 
     // Volume signal feeds into overall signals
     if (volume.scenarioType === "bullish" && !analysis.signals.find(s => s.name === "Volume"))
@@ -1102,6 +1208,8 @@ app.get("/api/stock/:symbol", async (req, res) => {
     const sectorInfo = getSectorInfo(symbol);
     res.json({
       symbol, price, change, changePct, sectorInfo, high52w, low52w,
+      todayOpen, todayHigh, todayLow,
+      liveQuote: liveQuote ? { source: liveQuote.source, isMarketOpen: liveQuote.isMarketOpen } : null,
       volume, ...analysis
     });
   } catch (err) {
@@ -1598,9 +1706,102 @@ app.get("/api/nifty/live", async (req, res) => {
   }
 });
 
+// ─── Live Quote (Intraday) ───────────────────────────────────────────────────
+// Primary:  Twelve Data API (key in TWELVE_DATA_KEY env var, free 800 calls/day)
+// Fallback: NSE quote-equity endpoint (no key, uses session cookie)
+// Cache:    5 minutes per symbol so we don't burn rate limits
+
+const TWELVE_KEY = process.env.TWELVE_DATA_KEY || "";
+const LIVE_CACHE_TTL = 5 * 60 * 1000; // 5 min
+
+async function fetchTwelveDataQuote(symbol) {
+  if (!TWELVE_KEY) return null;
+  try {
+    const url  = `https://api.twelvedata.com/quote?symbol=${encodeURIComponent(symbol)}:NSE&apikey=${TWELVE_KEY}`;
+    const res  = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (compatible)" } });
+    const json = await res.json();
+    if (json.status === "error" || !json.close) return null;
+    return {
+      price:     parseFloat(json.close),
+      open:      parseFloat(json.open),
+      high:      parseFloat(json.high),
+      low:       parseFloat(json.low),
+      change:    parseFloat(json.change),
+      changePct: parseFloat(json.percent_change),
+      prevClose: parseFloat(json.previous_close),
+      volume:    parseInt(json.volume) || 0,
+      isMarketOpen: !!json.is_market_open,
+      source:    "twelvedata"
+    };
+  } catch { return null; }
+}
+
+async function fetchNSEEquityQuote(symbol) {
+  try {
+    const cookies = await getNSECookies();
+    const res  = await fetch(
+      `https://www.nseindia.com/api/quote-equity?symbol=${encodeURIComponent(symbol)}`,
+      {
+        headers: {
+          "User-Agent":      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+          "Accept":          "application/json",
+          "Referer":         "https://www.nseindia.com/",
+          ...(cookies ? { Cookie: cookies } : {})
+        }
+      }
+    );
+    if (!res.ok) return null;
+    const json = await res.json();
+    const pi   = json?.priceInfo;
+    if (!pi || !pi.lastPrice) return null;
+    const ih = pi.intraDayHighLow || {};
+    return {
+      price:     pi.lastPrice,
+      open:      pi.open    ?? pi.previousClose,
+      high:      ih.max     ?? pi.lastPrice,
+      low:       ih.min     ?? pi.lastPrice,
+      change:    pi.change,
+      changePct: pi.pChange,
+      prevClose: pi.previousClose,
+      volume:    json.marketDeptOrderBook?.tradeInfo?.totalTradedVolume || 0,
+      isMarketOpen: true,
+      source:    "nse"
+    };
+  } catch { return null; }
+}
+
+async function fetchLiveQuote(symbol) {
+  const key = `live:${symbol}`;
+  const hit = _quoteCache.get(key);
+  if (hit && Date.now() < hit.expiry) return hit.data;
+
+  const data = await fetchTwelveDataQuote(symbol) || await fetchNSEEquityQuote(symbol);
+  if (data) _quoteCache.set(key, { data, expiry: Date.now() + LIVE_CACHE_TTL });
+  return data;
+}
+
+// Batch live quotes — used by the frontend to refresh a list of prices
+app.get("/api/live/quotes", async (req, res) => {
+  const symbols = (req.query.symbols || "").split(",").map(s => s.trim().toUpperCase()).filter(Boolean);
+  if (!symbols.length) return res.status(400).json({ error: "symbols param required" });
+
+  const results = {};
+  const BATCH = 6;
+  for (let i = 0; i < symbols.length; i += BATCH) {
+    const batch = symbols.slice(i, i + BATCH);
+    const quotes = await Promise.allSettled(batch.map(s => fetchLiveQuote(s)));
+    batch.forEach((sym, j) => {
+      results[sym] = quotes[j].status === "fulfilled" ? quotes[j].value : null;
+    });
+    if (i + BATCH < symbols.length) await new Promise(r => setTimeout(r, 200));
+  }
+  res.json({ quotes: results, timestamp: new Date().toISOString() });
+});
+
 // ─── Start ────────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Stock Dashboard → http://localhost:${PORT}`);
+  buildBhavMap(14).catch(e => console.error("[bhavcopy] startup build failed:", e));
 });
