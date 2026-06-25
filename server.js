@@ -1,7 +1,6 @@
 import express from "express";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
-import { createHash } from "crypto";
 import { inflateRawSync } from "zlib";
 import { EMA, RSI, MACD, BollingerBands, ATR, OBV } from "technicalindicators";
 
@@ -617,108 +616,56 @@ async function fetchNSEData(symbol, months = 6) {
 }
 
 // ─── Stooq Quotes for Global Indices ─────────────────────────────────────────
-// Bhavcopy only covers NSE equity. For global indices we use Stooq
-// (or NSE allIndices for India VIX). Stooq may serve a JS PoW challenge;
-// we solve it synchronously with createHash (d=4 ≈ 1 ms).
-
-const STOOQ_HDR = {
-  "User-Agent":      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-  "Accept-Language": "en-US,en;q=0.9",
-};
-let _stooqSession = { cookies: "", expiry: 0 };
-
-function solvePoW(c, d) {
-  const prefix = "0".repeat(d);
-  for (let n = 0; ; n++)
-    if (createHash("sha256").update(c + n).digest("hex").startsWith(prefix)) return n;
-}
-
-async function getStooqCookies() {
-  if (_stooqSession.cookies && Date.now() < _stooqSession.expiry) return _stooqSession.cookies;
-  const probe = await fetch("https://stooq.com/q/d/l/?s=%5Espx&i=d", { headers: STOOQ_HDR });
-  const pc    = (probe.headers.getSetCookie?.() || []).map(c => c.split(";")[0]).join("; ");
-  if (!(probe.headers.get("content-type") || "").includes("html")) {
-    _stooqSession = { cookies: pc, expiry: Date.now() + 2 * 3600_000 };
-    return pc;
-  }
-  const html = await probe.text();
-  const m    = html.match(/c="([^"]+)",d=(\d+)/);
-  if (!m) { _stooqSession = { cookies: pc, expiry: Date.now() + 3600_000 }; return pc; }
-  const n   = solvePoW(m[1], +m[2]);
-  const ver = await fetch("https://stooq.com/__verify", {
-    method: "POST",
-    headers: { ...STOOQ_HDR, "Content-Type": "application/x-www-form-urlencoded",
-               "Referer": "https://stooq.com/", ...(pc ? { Cookie: pc } : {}) },
-    body: `c=${encodeURIComponent(m[1])}&n=${n}`
-  });
-  const vc  = (ver.headers.getSetCookie?.() || []).map(c => c.split(";")[0]).join("; ");
-  const all = [pc, vc].filter(Boolean).join("; ");
-  _stooqSession = { cookies: all, expiry: Date.now() + 2 * 3600_000 };
-  return all;
-}
-
-async function fetchStooqCSV(url) {
-  const cookies = await getStooqCookies();
-  const res  = await fetch(url, { headers: { ...STOOQ_HDR, ...(cookies ? { Cookie: cookies } : {}) } });
-  if (!res.ok) throw new Error(`Stooq ${res.status}`);
-  const text = await res.text();
-  if (text.trimStart().startsWith("<")) { // challenge again — retry once
-    _stooqSession = { cookies: "", expiry: 0 };
-    const c2  = await getStooqCookies();
-    const r2  = await fetch(url, { headers: { ...STOOQ_HDR, ...(c2 ? { Cookie: c2 } : {}) } });
-    return r2.text();
-  }
-  return text;
-}
-
-const STOOQ_MAP = {
-  "^GSPC":     "^spx",   "^DJI":     "^dji",   "^IXIC":    "^ndq",
-  "^N225":     "^nk225", "^HSI":     "^hsi",
-  "^FTSE":     "^ftse",  "^GDAXI":   "^dax",
-  "^NSEI":     "^nsei",  "^BSESN":   "^bsesn",
-  "^INDIAVIX": null,
-  "BZ=F":      "co.f",   "GC=F":     "gc.f",
-  "USDINR=X":  "usdinr", "DX-Y.NYB": "dxy.f"
-};
-
-async function fetchStooqQuote(yahooSymbol) {
-  const sym = STOOQ_MAP[yahooSymbol];
-  if (!sym) return null;
-  const key = `sq:${sym}`;
+// fetchGlobalQuote: Yahoo Finance v8 chart — works for indices, futures, FX
+// Same crumb-free endpoint used for NSE stocks, but with Yahoo symbols directly.
+async function fetchGlobalQuote(yahooSymbol) {
+  const key = `gq:${yahooSymbol}`;
   const hit = _quoteCache.get(key);
   if (hit && Date.now() < hit.expiry) return hit.data;
   try {
-    const text  = await fetchStooqCSV(`https://stooq.com/q/d/l/?s=${encodeURIComponent(sym)}&i=d`);
-    const lines = text.trim().split("\n");
-    if (lines.length < 3) return null;
-    const p = l => parseFloat(l.split(",")[4]);
-    const curr = p(lines[1]), prev = p(lines[2]);
-    if (!curr || !prev) return null;
-    const data = { price: curr, change: +(curr-prev).toFixed(4), changePct: +((curr-prev)/prev*100).toFixed(2), prevClose: prev };
+    const url  = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}?interval=1d&range=2d`;
+    const res  = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36" } });
+    if (!res.ok) return null;
+    const json = await res.json();
+    const meta = json?.chart?.result?.[0]?.meta;
+    if (!meta?.regularMarketPrice) return null;
+    const price = meta.regularMarketPrice;
+    const prev  = meta.chartPreviousClose || meta.previousClose || 0;
+    const data  = {
+      price,
+      change:    prev ? +(price - prev).toFixed(4)              : 0,
+      changePct: prev ? +((price - prev) / prev * 100).toFixed(2) : 0,
+      prevClose: prev
+    };
     _quoteCache.set(key, { data, expiry: Date.now() + QUOTE_CACHE_TTL });
     return data;
   } catch { return null; }
 }
 
-// Nifty 50 daily from bhavcopy (Nifty index itself is in NSE bhavcopy as underlying)
-// For the Nifty signal we use the NSE allIndices + bhavcopy for the series
+// Nifty 50 daily series from Yahoo v8 chart (index not in bhavcopy)
 async function fetchNiftyDaily(months = 5) {
   const key = `^nsei:daily:${months}`;
   const hit = _dataCache.get(key);
   if (hit && Date.now() < hit.expiry) return hit.data;
-  // Nifty 50 index OHLCV is not in the CM bhavcopy (equities only).
-  // Fall back to Stooq for the Nifty index series.
   try {
-    const start = new Date(); start.setMonth(start.getMonth() - months);
-    const d1  = start.toISOString().slice(0, 10).replace(/-/g, "");
-    const d2  = new Date().toISOString().slice(0, 10).replace(/-/g, "");
-    const text = await fetchStooqCSV(`https://stooq.com/q/d/l/?s=%5Ensei&d1=${d1}&d2=${d2}&i=d`);
-    const lines = text.trim().split("\n");
-    const data  = lines.slice(1)
-      .map(l => { const [date, open, high, low, close, volume] = l.split(",");
-        return { date, open: +open, high: +high, low: +low, close: +close, volume: +volume || 0 }; })
-      .filter(d => d.close && !isNaN(d.close))
+    const range = months <= 3 ? "3mo" : months <= 6 ? "6mo" : "1y";
+    const url   = `https://query1.finance.yahoo.com/v8/finance/chart/%5ENSEI?interval=1d&range=${range}`;
+    const res   = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36" } });
+    if (!res.ok) return [];
+    const json   = await res.json();
+    const result = json?.chart?.result?.[0];
+    if (!result?.timestamp?.length) return [];
+    const ohlcv = result.indicators?.quote?.[0];
+    const data  = result.timestamp
+      .map((ts, i) => ({
+        date:   new Date(ts * 1000).toISOString().slice(0, 10),
+        open:   ohlcv.open[i]   || 0,
+        high:   ohlcv.high[i]   || 0,
+        low:    ohlcv.low[i]    || 0,
+        close:  ohlcv.close[i]  || 0,
+        volume: ohlcv.volume[i] || 0
+      }))
+      .filter(d => d.close > 0)
       .sort((a, b) => a.date.localeCompare(b.date));
     _dataCache.set(key, { data, expiry: Date.now() + DATA_CACHE_TTL });
     return data;
@@ -1179,7 +1126,7 @@ function computeGlobalSentiment(indices) {
 // Global indices + sentiment — sourced from Stooq (no API key, no crumb)
 app.get("/api/global", async (req, res) => {
   const [stooqResults, nseList] = await Promise.all([
-    Promise.all(GLOBAL_INDICES.map(m => fetchStooqQuote(m.symbol))),
+    Promise.all(GLOBAL_INDICES.map(m => fetchGlobalQuote(m.symbol))),
     fetchNSEIndices()
   ]);
   const vix = nseIndexQuote(nseList, "INDIA VIX");
@@ -1526,7 +1473,7 @@ app.get("/api/nifty/signal", async (req, res) => {
   try {
     const [dailyData, stooqGlobals, nseList] = await Promise.all([
       fetchNiftyDaily(5),
-      Promise.all(GLOBAL_INDICES.map(m => fetchStooqQuote(m.symbol))),
+      Promise.all(GLOBAL_INDICES.map(m => fetchGlobalQuote(m.symbol))),
       fetchNSEIndices()
     ]);
     const vix = nseIndexQuote(nseList, "INDIA VIX");
