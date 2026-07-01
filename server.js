@@ -891,11 +891,9 @@ function backtestSignals(data, holdDays = 15) {
     const rsiOk      = rs[i] >= 50 && rs[i] <= 68;
     const macdOk     = mc[i].MACD > mc[i].signal;
 
-    // BUY only when: EMA9>EMA21 (fresh cross preferred) + above EMA50 + RSI 50–68 + MACD bullish
-    const isBuy = emaOk && rsiOk && macdOk;
-    const reason = freshCross
-      ? `Fresh EMA9×21 cross · RSI ${rs[i].toFixed(0)} · MACD bullish · Above EMA50`
-      : `EMA9>21 · RSI ${rs[i].toFixed(0)} · MACD bullish · Above EMA50`;
+    // BUY only on fresh EMA9×EMA21 bullish crossover
+    const isBuy  = freshCross;
+    const reason = `Fresh EMA9×21 cross · RSI ${rs[i].toFixed(0)} · ${macdOk ? "MACD bullish" : "MACD bearish"} · ${aboveE50 ? "Above" : "Below"} EMA50`;
 
     if (i === len - 1) {
       todaySignal  = isBuy;

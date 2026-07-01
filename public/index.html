@@ -1305,7 +1305,7 @@
     async function loadBacktest(symbol) {
       const panel = document.getElementById("backtestPanel");
       try {
-        const res  = await fetch(`/api/backtest/${symbol}?months=24&holdDays=15`);
+        const res  = await fetch(`/api/backtest/${symbol}?months=12&holdDays=15`);
         const data = await res.json();
         if (!panel) return; // user navigated away before this resolved
         if (data.error) {
@@ -1388,9 +1388,9 @@
           </table>
         </div>
         <div style="margin-top:8px;font-size:11px;color:#475569">
-          Signal conditions: EMA9 &gt; EMA21 · RSI 50–68 · MACD bullish · Price above EMA50 ·
-          WIN = T1 hit (HIGH ≥ T1) · LOSS = SL hit (LOW ≤ SL) · TIMEOUT = neither in ${bt.holdDays}d.
-          ✦CROSS = fresh EMA9×21 crossover day. Past performance ≠ future results.
+          Signal: fresh EMA9×EMA21 bullish crossover (1 year data, daily candles) ·
+          WIN = T1 hit (HIGH ≥ T1=entry+2×ATR) · LOSS = SL hit (LOW ≤ SL=entry−1.5×ATR) · TIMEOUT = neither in ${bt.holdDays}d.
+          Past performance ≠ future results.
         </div>`;
     }
 
