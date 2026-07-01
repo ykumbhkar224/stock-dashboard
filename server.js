@@ -867,124 +867,93 @@ function backtestSignals(data, holdDays = 15) {
                                     SimpleMAOscillator: false, SimpleMASignal: false });
   const atrArr   = ATR.calculate({ high: highs, low: lows, close: closes, period: 14 });
 
-  const pad  = arr => Array(len - arr.length).fill(null).concat(arr);
-  const e9   = pad(ema9arr);
-  const e21  = pad(ema21arr);
-  const e50  = pad(ema50arr);
-  const rs   = pad(rsiArr);
-  const mc   = pad(macdArr);
-  const at   = pad(atrArr);
+  const pad = arr => Array(len - arr.length).fill(null).concat(arr);
+  const e9  = pad(ema9arr);
+  const e21 = pad(ema21arr);
+  const e50 = pad(ema50arr);
+  const rs  = pad(rsiArr);
+  const mc  = pad(macdArr);
+  const at  = pad(atrArr);
 
-  const dailySignals = []; // signal for every trading day
-  const trades       = []; // only BUY-signal days with forward-looking outcome
+  const trades     = [];
+  let todaySignal  = false;
+  let todayReason  = "";
+  let todayMetrics = {};
 
   for (let i = 1; i < len; i++) {
     if (e50[i] == null || rs[i] == null || !mc[i] || at[i] == null) continue;
 
-    const price      = closes[i];
-    const aboveE50   = price > e50[i];
-    const trendUp    = e9[i] > e21[i];
-    const freshBull  = e9[i] > e21[i] && e9[i-1] != null && e9[i-1] <= e21[i-1];
-    const freshBear  = e9[i] < e21[i] && e9[i-1] != null && e9[i-1] >= e21[i-1];
-    const macdBull   = mc[i].MACD > mc[i].signal;
-    const macdBear   = mc[i].MACD < mc[i].signal;
+    const price     = closes[i];
+    const aboveE50  = price > e50[i];
+    // Strict BUY: ALL four conditions must be true simultaneously
+    const freshCross = e9[i] > e21[i] && e9[i-1] != null && e9[i-1] <= e21[i-1];
+    const emaOk      = e9[i] > e21[i] && aboveE50;
+    const rsiOk      = rs[i] >= 50 && rs[i] <= 68;
+    const macdOk     = mc[i].MACD > mc[i].signal;
 
-    // ── Daily signal classification ──────────────────────────────────────────
-    let signal = "HOLD", reason = "";
-    let buyStrength = 0;
+    // BUY only when: EMA9>EMA21 (fresh cross preferred) + above EMA50 + RSI 50–68 + MACD bullish
+    const isBuy = emaOk && rsiOk && macdOk;
+    const reason = freshCross
+      ? `Fresh EMA9×21 cross · RSI ${rs[i].toFixed(0)} · MACD bullish · Above EMA50`
+      : `EMA9>21 · RSI ${rs[i].toFixed(0)} · MACD bullish · Above EMA50`;
 
-    if (freshBull)                                     { buyStrength += 3; }
-    if (aboveE50 && trendUp && rs[i] >= 50 && rs[i] <= 75) { buyStrength += 2; }
-    if (macdBull && aboveE50)                          { buyStrength += 1; }
-    if (rs[i] >= 50 && rs[i] <= 70 && aboveE50)       { buyStrength += 1; }
-
-    if (buyStrength >= 3) {
-      signal = "BUY";
-      reason = freshBull ? "EMA9 × EMA21 fresh cross" : "EMA trend + RSI + MACD aligned";
-    } else if (freshBear) {
-      signal = "SELL"; reason = "EMA9 crossed below EMA21";
-    } else if (rs[i] > 75) {
-      signal = "SELL"; reason = `RSI overbought (${rs[i].toFixed(0)})`;
-    } else if (!trendUp && macdBear && rs[i] < 45) {
-      signal = "SELL"; reason = "Downtrend + MACD bearish";
-    } else if (rs[i] < 30) {
-      signal = "CAUTION"; reason = "RSI oversold — wait";
-    } else if (buyStrength >= 2) {
-      signal = "WATCH"; reason = "Setup building";
+    if (i === len - 1) {
+      todaySignal  = isBuy;
+      todayReason  = isBuy ? reason : "";
+      todayMetrics = {
+        ema9: +e9[i].toFixed(2), ema21: +e21[i].toFixed(2),
+        ema50: +e50[i].toFixed(2), rsi: +rs[i].toFixed(1),
+        macd: +mc[i].MACD.toFixed(2), macdSignal: +mc[i].signal.toFixed(2)
+      };
+      continue;
     }
 
-    dailySignals.push({
-      date:   data[i].date,
-      close:  +price.toFixed(2),
-      signal,
-      reason,
-      ema9:   e9[i]  ? +e9[i].toFixed(2)  : null,
-      ema21:  e21[i] ? +e21[i].toFixed(2) : null,
-      rsi:    rs[i]  ? +rs[i].toFixed(1)  : null,
-    });
+    if (!isBuy) continue;
 
-    // ── Trade backtest: only on BUY days with future data available ──────────
-    if (signal !== "BUY" || i >= len - 1) continue;
+    const entry  = price;
+    const atr    = at[i];
+    const t1     = +(entry + atr * 2).toFixed(2);
+    const t2     = +(entry + atr * 3).toFixed(2);
+    const sl     = +(entry - atr * 1.5).toFixed(2);
+    const maxIdx = Math.min(i + holdDays, len - 1);
 
-    const entry   = price;
-    const atr     = at[i];
-    const t1      = +(entry + atr * 2).toFixed(2);
-    const t2      = +(entry + atr * 3).toFixed(2);
-    const sl      = +(entry - atr * 1.5).toFixed(2);
-    const maxIdx  = Math.min(i + holdDays, len - 1);
-
-    // Walk forward day by day: first touch of T1 = WIN, SL = LOSS, else TIMEOUT
-    let result = "TIMEOUT", exitPrice = closes[maxIdx], exitDate = data[maxIdx].date, exitDay = maxIdx - i;
+    // Walk forward: first day HIGH >= T1 → WIN, LOW <= SL → LOSS, else TIMEOUT
+    let result = "TIMEOUT", exitPrice = closes[maxIdx], exitDate = data[maxIdx].date, exitDays = maxIdx - i;
     for (let j = i + 1; j <= maxIdx; j++) {
-      if (lows[j] <= sl) {
-        result = "LOSS"; exitPrice = sl; exitDate = data[j].date; exitDay = j - i; break;
-      }
-      if (highs[j] >= t1) {
-        result = "WIN";  exitPrice = t1; exitDate = data[j].date; exitDay = j - i; break;
-      }
+      if (lows[j]  <= sl) { result = "LOSS"; exitPrice = sl; exitDate = data[j].date; exitDays = j - i; break; }
+      if (highs[j] >= t1) { result = "WIN";  exitPrice = t1; exitDate = data[j].date; exitDays = j - i; break; }
     }
 
     trades.push({
-      entryDate: data[i].date,
-      entry:     +entry.toFixed(2),
-      target1:   t1, target2: t2, stopLoss: sl,
-      exit:      +exitPrice.toFixed(2),
-      exitDate,  days: exitDay, result,
-      t1Hit:     result === "WIN",
+      entryDate: data[i].date, entry: +entry.toFixed(2),
+      target1: t1, target2: t2, stopLoss: sl,
+      exit: +exitPrice.toFixed(2), exitDate, days: exitDays,
+      result, freshCross,
       returnPct: +(((exitPrice - entry) / entry) * 100).toFixed(2)
     });
   }
 
-  // ── Stats ─────────────────────────────────────────────────────────────────
   const wins     = trades.filter(t => t.result === "WIN");
   const losses   = trades.filter(t => t.result === "LOSS");
   const timeouts = trades.filter(t => t.result === "TIMEOUT");
-  // Win rate = wins / (wins + losses) — only resolved trades, not timeouts
   const resolved = wins.length + losses.length;
   const winRate  = resolved ? +((wins.length / resolved) * 100).toFixed(1) : 0;
   const t1Rate   = trades.length ? +((wins.length / trades.length) * 100).toFixed(1) : 0;
-  const avgWin   = wins.length   ? +(wins.reduce((s,t)   => s + t.returnPct, 0) / wins.length).toFixed(2)   : 0;
+  const avgWin   = wins.length   ? +(wins.reduce((s,t) => s + t.returnPct, 0) / wins.length).toFixed(2)   : 0;
   const avgLoss  = losses.length ? +(losses.reduce((s,t) => s + t.returnPct, 0) / losses.length).toFixed(2) : 0;
   const avgRet   = trades.length ? +(trades.reduce((s,t) => s + t.returnPct, 0) / trades.length).toFixed(2) : 0;
-  const avgHold  = trades.length ? +(trades.reduce((s,t) => s + t.days, 0) / trades.length).toFixed(1)      : 0;
-
-  const todayDs  = dailySignals[dailySignals.length - 1] || null;
+  const avgHold  = trades.length ? +(trades.reduce((s,t) => s + t.days, 0) / trades.length).toFixed(1)    : 0;
 
   return {
-    todaySignal:  todayDs?.signal === "BUY",
-    todayDaily:   todayDs,
+    todaySignal, todayReason, todayMetrics,
     totalSignals: trades.length,
-    wins:         wins.length,
-    losses:       losses.length,
-    timeouts:     timeouts.length,
-    winRate,      // wins / (wins+losses) — clean resolved-only rate
-    t1Rate,       // wins / all signals — T1 actually hit rate
-    avgReturn:    avgRet,
-    avgWin,       avgLoss,
-    avgHoldDays:  avgHold,
-    expectancy:   resolved ? +(((winRate/100)*avgWin) + ((1-winRate/100)*avgLoss)).toFixed(2) : 0,
-    trades:       trades.slice(-50).reverse(),
-    dailySignals: dailySignals.slice(-90).reverse()
+    wins: wins.length, losses: losses.length, timeouts: timeouts.length,
+    winRate,   // wins ÷ (wins+losses) — resolved only
+    t1Rate,    // wins ÷ all signals
+    riskReward: "1.5 : 2.0",  // SL=1.5×ATR, T1=2×ATR
+    avgWin, avgLoss, avgReturn: avgRet, avgHoldDays: avgHold,
+    expectancy: resolved ? +(((winRate/100)*avgWin) + ((1-winRate/100)*avgLoss)).toFixed(2) : 0,
+    trades: trades.reverse()
   };
 }
 

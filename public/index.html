@@ -1323,90 +1323,74 @@
       if (!panel) return;
 
       if (bt.totalSignals === 0) {
-        panel.innerHTML = `<div style="color:#94a3b8;font-size:13px">No BUY signals fired in the last ${bt.months} months — insufficient data.</div>`;
+        panel.innerHTML = `<div style="color:#94a3b8;font-size:13px;padding:12px">No BUY signals fired in the last ${bt.months} months — not enough qualifying setups yet.</div>`;
         return;
       }
 
-      const winColor = bt.winRate >= 60 ? "green" : bt.winRate >= 45 ? "yellow" : "red";
-      const expColor = bt.expectancy >= 0 ? "green" : "red";
-      const verdict  = bt.winRate >= 60 && bt.expectancy > 0
-        ? `✅ Strong setup on ${bt.symbol} — ${bt.winRate}% of BUY signals hit Target 1 before stop-loss.`
-        : bt.winRate >= 45 && bt.expectancy > 0
-        ? `⚠️ Mixed results — ${bt.winRate}% T1 hit rate. Size positions carefully.`
-        : `🚫 Strategy has underperformed on ${bt.symbol} — ${bt.winRate}% T1 hit rate. Treat today's signal with caution.`;
+      const winC  = bt.winRate >= 60 ? "#4ade80" : bt.winRate >= 45 ? "#fbbf24" : "#f87171";
+      const expC  = bt.expectancy >= 0 ? "#4ade80" : "#f87171";
+      const rrNum = bt.riskReward || "1.5 : 2.0";
 
-      const todayDs = bt.todayDaily;
-      const sigColor = { BUY:"#4ade80", SELL:"#f87171", HOLD:"#94a3b8", WATCH:"#fbbf24", CAUTION:"#fb923c" };
-      const todayNote = todayDs ? `
-        <div style="margin-top:10px;padding:10px 14px;background:#0f172a;border:1px solid #1e293b;border-radius:8px;font-size:12.5px">
-          <span style="color:${sigColor[todayDs.signal]||'#94a3b8'};font-weight:700;font-size:14px">${todayDs.signal}</span>
-          <span style="color:#94a3b8;margin-left:8px">${todayDs.reason}</span>
-          <span style="color:#475569;margin-left:12px">RSI ${todayDs.rsi} · EMA9 ${todayDs.ema9} · EMA21 ${todayDs.ema21}</span>
-          ${bt.todaySignal ? `<div style="color:#64748b;font-size:11.5px;margin-top:4px">Based on ${bt.totalSignals} past BUY signals: <b style="color:${winColor}">${bt.winRate}% T1 hit rate</b> (wins vs losses only), avg return <b style="color:${bt.avgReturn>=0?'#4ade80':'#f87171'}">${bt.avgReturn>=0?'+':''}${bt.avgReturn}%</b> over ~${bt.avgHoldDays}d</div>` : ""}
-        </div>` : "";
+      // Today's signal banner
+      const todayBanner = bt.todaySignal
+        ? `<div style="padding:12px 14px;background:#052e16;border:1px solid #166534;border-radius:8px;margin-bottom:12px">
+            <div style="color:#4ade80;font-weight:700;font-size:14px">🟢 BUY signal active today</div>
+            <div style="color:#86efac;font-size:12px;margin-top:4px">${bt.todayReason}</div>
+            <div style="color:#4ade80;font-size:11.5px;margin-top:6px">
+              Historical performance: <b>${bt.winRate}%</b> win rate (T1 hit) · avg +${bt.avgWin}% win / ${bt.avgLoss}% loss · expectancy <b>${bt.expectancy>=0?'+':''}${bt.expectancy}%</b> per trade
+            </div>
+          </div>`
+        : `<div style="padding:10px 14px;background:#0f172a;border:1px solid #1e293b;border-radius:8px;margin-bottom:12px;color:#64748b;font-size:12.5px">
+            No BUY signal today — conditions (EMA9>21, RSI 50–68, MACD bullish, above EMA50) not all met.
+          </div>`;
 
-      // Daily signal table — BUY/SELL/HOLD for every day
-      const dsRows = (bt.dailySignals || []).map(d => {
-        const sc  = sigColor[d.signal] || "#94a3b8";
-        const cls = d.signal === "BUY" ? "green" : d.signal === "SELL" ? "red" : "";
+      // Stats row
+      const stats = `
+        <div class="indicators-grid" style="margin-bottom:12px">
+          <div class="ind-box"><div class="ind-label">Total BUY Signals</div><div class="ind-value">${bt.totalSignals}</div></div>
+          <div class="ind-box"><div class="ind-label">Win / Loss / Timeout</div><div class="ind-value">${bt.wins} / ${bt.losses} / ${bt.timeouts}</div></div>
+          <div class="ind-box"><div class="ind-label">Win Rate (T1 hit)</div><div class="ind-value" style="color:${winC}">${bt.winRate}%</div></div>
+          <div class="ind-box"><div class="ind-label">Avg Win / Avg Loss</div><div class="ind-value">+${bt.avgWin}% / ${bt.avgLoss}%</div></div>
+          <div class="ind-box"><div class="ind-label">Risk:Reward Ratio</div><div class="ind-value">${rrNum}</div></div>
+          <div class="ind-box"><div class="ind-label">Expectancy/Trade</div><div class="ind-value" style="color:${expC}">${bt.expectancy>=0?'+':''}${bt.expectancy}%</div></div>
+        </div>`;
+
+      // Trade rows — entry / T1 / SL / exit / days / result / return
+      const rows = bt.trades.map(t => {
+        const rc  = t.result === "WIN" ? "#4ade80" : t.result === "LOSS" ? "#f87171" : "#94a3b8";
+        const ret = t.returnPct >= 0 ? `<span style="color:#4ade80">+${t.returnPct}%</span>` : `<span style="color:#f87171">${t.returnPct}%</span>`;
+        const cross = t.freshCross ? `<span style="color:#fbbf24;font-size:10px"> ✦CROSS</span>` : "";
         return `<tr>
-          <td style="color:#94a3b8">${d.date}</td>
-          <td>₹${d.close}</td>
-          <td style="color:${sc};font-weight:600">${d.signal}</td>
-          <td style="color:#64748b;font-size:11px">${d.reason}</td>
-          <td style="color:#64748b">${d.rsi}</td>
-        </tr>`;
-      }).join("");
-
-      // Trade backtest table — only BUY signal days with T1/SL outcome
-      const trRows = bt.trades.map(t => {
-        const resColor = t.result==="WIN" ? "#4ade80" : t.result==="LOSS" ? "#f87171" : "#94a3b8";
-        const retColor = t.returnPct >= 0 ? "green" : "red";
-        return `<tr>
-          <td style="color:#94a3b8">${t.entryDate}</td>
+          <td style="color:#94a3b8">${t.entryDate}${cross}</td>
           <td>₹${t.entry}</td>
-          <td style="color:#4ade80;font-size:11px">T1:₹${t.target1}</td>
-          <td style="color:#f87171;font-size:11px">SL:₹${t.stopLoss}</td>
-          <td>₹${t.exit}</td>
+          <td style="color:#4ade80">₹${t.target1}</td>
+          <td style="color:#f87171">₹${t.stopLoss}</td>
+          <td style="color:#cbd5e1">₹${t.exit}</td>
+          <td style="color:#64748b">${t.exitDate}</td>
           <td style="color:#64748b">${t.days}d</td>
-          <td style="color:${resColor};font-weight:600">${t.result}</td>
-          <td class="${retColor}">${t.returnPct>=0?'+':''}${t.returnPct}%</td>
+          <td style="color:${rc};font-weight:600">${t.result}</td>
+          <td>${ret}</td>
         </tr>`;
       }).join("");
 
       panel.innerHTML = `
-        <div class="ind-box" style="grid-column:1/-1;background:#0f172a;border:1px solid #1e293b;padding:10px 14px;font-size:13px;color:#cbd5e1">${verdict}</div>
-        <div class="indicators-grid" style="margin-top:10px">
-          <div class="ind-box"><div class="ind-label">T1 Hit Rate</div><div class="ind-value ${winColor}">${bt.t1Rate}%</div></div>
-          <div class="ind-box"><div class="ind-label">Win/Loss/Timeout</div><div class="ind-value">${bt.wins} / ${bt.losses} / ${bt.timeouts}</div></div>
-          <div class="ind-box"><div class="ind-label">Win Rate (resolved)</div><div class="ind-value ${winColor}">${bt.winRate}%</div></div>
-          <div class="ind-box"><div class="ind-label">Avg Return</div><div class="ind-value ${bt.avgReturn>=0?'green':'red'}">${bt.avgReturn>=0?'+':''}${bt.avgReturn}%</div></div>
-          <div class="ind-box"><div class="ind-label">Avg Win / Loss</div><div class="ind-value">+${bt.avgWin}% / ${bt.avgLoss}%</div></div>
-          <div class="ind-box"><div class="ind-label">Expectancy/Trade</div><div class="ind-value ${expColor}">${bt.expectancy>=0?'+':''}${bt.expectancy}%</div></div>
-        </div>
-        ${todayNote}
-
-        <div style="margin-top:16px">
-          <div style="font-size:12px;color:#64748b;margin-bottom:6px;font-weight:600;letter-spacing:.05em">DAILY SIGNAL — EVERY DAY (last 90)</div>
-          <div style="overflow-x:auto;max-height:260px;overflow-y:auto">
-            <table class="vt-table">
-              <thead><tr><th>Date</th><th>Close</th><th>Signal</th><th>Reason</th><th>RSI</th></tr></thead>
-              <tbody>${dsRows}</tbody>
-            </table>
-          </div>
-        </div>
-
-        <div style="margin-top:16px">
-          <div style="font-size:12px;color:#64748b;margin-bottom:6px;font-weight:600;letter-spacing:.05em">BUY SIGNAL BACKTEST — TARGET 1 TRACKING (last 50)</div>
-          <div style="overflow-x:auto">
-            <table class="vt-table">
-              <thead><tr><th>Entry Date</th><th>Entry</th><th>Target 1</th><th>Stop Loss</th><th>Exit</th><th>Days</th><th>Result</th><th>Return</th></tr></thead>
-              <tbody>${trRows}</tbody>
-            </table>
-          </div>
+        ${todayBanner}
+        ${stats}
+        <div style="overflow-x:auto">
+          <table class="vt-table">
+            <thead>
+              <tr>
+                <th>Entry Date</th><th>Entry</th><th>Target 1</th><th>Stop Loss</th>
+                <th>Exit Price</th><th>Exit Date</th><th>Days</th><th>Result</th><th>Return</th>
+              </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>
         </div>
         <div style="margin-top:8px;font-size:11px;color:#475569">
-          WIN = Target 1 hit before stop-loss · LOSS = stop-loss hit first · TIMEOUT = neither hit in ${bt.holdDays}d (exits at close). Past performance ≠ future results.
+          Signal conditions: EMA9 &gt; EMA21 · RSI 50–68 · MACD bullish · Price above EMA50 ·
+          WIN = T1 hit (HIGH ≥ T1) · LOSS = SL hit (LOW ≤ SL) · TIMEOUT = neither in ${bt.holdDays}d.
+          ✦CROSS = fresh EMA9×21 crossover day. Past performance ≠ future results.
         </div>`;
     }
 
