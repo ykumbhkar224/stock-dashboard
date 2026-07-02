@@ -928,6 +928,7 @@ function calcIndicators(data) {
 
 function backtestSignals(data, holdDays = 15, mode = "cross-only", sectorData = null) {
   const closes  = data.map(d => d.close);
+  const opens   = data.map(d => d.open || d.close);
   const highs   = data.map(d => d.high);
   const lows    = data.map(d => d.low);
   const volumes = data.map(d => d.volume);
@@ -1014,19 +1015,20 @@ function backtestSignals(data, holdDays = 15, mode = "cross-only", sectorData = 
 
     if (!isBuy) continue;
 
-    // Entry at bar i-1 close: the day the cross visually appears on the chart.
-    // Bar i only confirms it by close; the actual crossing happened during bar i-1→i.
-    const eb     = i - 1;                          // visual crossover bar
-    const entry  = closes[eb];
-    const atr    = at[eb] || at[i];
+    // Cross confirmed at bar i close. Earliest actual entry = bar i+1 open
+    // (market is closed by the time you see the crossover signal).
+    const eb     = i + 1;                          // next-day entry bar
+    if (eb >= len) continue;                       // no next bar (last candle)
+    const entry  = opens[eb];                      // buy at next day's open
+    const atr    = at[i] || at[i - 1];
     const t1     = +(entry + atr * 2).toFixed(2);
     const t2     = +(entry + atr * 3).toFixed(2);
     const sl     = +(entry - atr * 1.5).toFixed(2);
     const maxIdx = Math.min(eb + holdDays, len - 1);
 
-    // Forward walk starts from bar i (day after visual entry)
+    // Forward walk starts from entry bar (same day — check if open day hits T1/SL)
     let result = "TIMEOUT", exitPrice = closes[maxIdx], exitDate = data[maxIdx].date, exitDays = maxIdx - eb;
-    for (let j = i; j <= maxIdx; j++) {
+    for (let j = eb; j <= maxIdx; j++) {
       if (lows[j]  <= sl) { result = "LOSS"; exitPrice = sl; exitDate = data[j].date; exitDays = j - eb; break; }
       if (highs[j] >= t1) { result = "WIN";  exitPrice = t1; exitDate = data[j].date; exitDays = j - eb; break; }
     }
