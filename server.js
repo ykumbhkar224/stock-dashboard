@@ -1014,22 +1014,25 @@ function backtestSignals(data, holdDays = 15, mode = "cross-only", sectorData = 
 
     if (!isBuy) continue;
 
-    const entry  = price;
-    const atr    = at[i];
+    // Entry at bar i-1 close: the day the cross visually appears on the chart.
+    // Bar i only confirms it by close; the actual crossing happened during bar i-1→i.
+    const eb     = i - 1;                          // visual crossover bar
+    const entry  = closes[eb];
+    const atr    = at[eb] || at[i];
     const t1     = +(entry + atr * 2).toFixed(2);
     const t2     = +(entry + atr * 3).toFixed(2);
     const sl     = +(entry - atr * 1.5).toFixed(2);
-    const maxIdx = Math.min(i + holdDays, len - 1);
+    const maxIdx = Math.min(eb + holdDays, len - 1);
 
-    // Walk forward: HIGH >= T1 → WIN, LOW <= SL → LOSS, else TIMEOUT
-    let result = "TIMEOUT", exitPrice = closes[maxIdx], exitDate = data[maxIdx].date, exitDays = maxIdx - i;
-    for (let j = i + 1; j <= maxIdx; j++) {
-      if (lows[j]  <= sl) { result = "LOSS"; exitPrice = sl; exitDate = data[j].date; exitDays = j - i; break; }
-      if (highs[j] >= t1) { result = "WIN";  exitPrice = t1; exitDate = data[j].date; exitDays = j - i; break; }
+    // Forward walk starts from bar i (day after visual entry)
+    let result = "TIMEOUT", exitPrice = closes[maxIdx], exitDate = data[maxIdx].date, exitDays = maxIdx - eb;
+    for (let j = i; j <= maxIdx; j++) {
+      if (lows[j]  <= sl) { result = "LOSS"; exitPrice = sl; exitDate = data[j].date; exitDays = j - eb; break; }
+      if (highs[j] >= t1) { result = "WIN";  exitPrice = t1; exitDate = data[j].date; exitDays = j - eb; break; }
     }
 
     trades.push({
-      entryDate: data[i].date, entry: +entry.toFixed(2),
+      entryDate: data[eb].date, entry: +entry.toFixed(2),
       target1: t1, target2: t2, stopLoss: sl,
       exit: +exitPrice.toFixed(2), exitDate, days: exitDays,
       result, freshCross, filterScore, sectorOk,
