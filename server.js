@@ -1015,18 +1015,17 @@ function backtestSignals(data, holdDays = 15, mode = "cross-only", sectorData = 
 
     if (!isBuy) continue;
 
-    // Cross confirmed at bar i close. Earliest actual entry = bar i+1 open
-    // (market is closed by the time you see the crossover signal).
-    const eb     = i + 1;                          // next-day entry bar
-    if (eb >= len) continue;                       // no next bar (last candle)
-    const entry  = opens[eb];                      // buy at next day's open
-    const atr    = at[i] || at[i - 1];
+    // Bar i-1 is the visual crossover day. Enter at that bar's open —
+    // a trader watching the EMA lines converge would enter at the day's open.
+    const eb     = i - 1;                          // visual crossover bar
+    const entry  = opens[eb];                      // buy at crossover day open
+    const atr    = at[eb] || at[i];
     const t1     = +(entry + atr * 2).toFixed(2);
     const t2     = +(entry + atr * 3).toFixed(2);
     const sl     = +(entry - atr * 1.5).toFixed(2);
     const maxIdx = Math.min(eb + holdDays, len - 1);
 
-    // Forward walk starts from entry bar (same day — check if open day hits T1/SL)
+    // Walk from same day (that day's high/low could hit T1 or SL)
     let result = "TIMEOUT", exitPrice = closes[maxIdx], exitDate = data[maxIdx].date, exitDays = maxIdx - eb;
     for (let j = eb; j <= maxIdx; j++) {
       if (lows[j]  <= sl) { result = "LOSS"; exitPrice = sl; exitDate = data[j].date; exitDays = j - eb; break; }
