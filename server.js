@@ -225,6 +225,39 @@ const STOCK_SECTORS = {
   TATACHEM:"Chemicals",
 };
 
+// Sector name → NSE sector index Yahoo Finance symbol
+const SECTOR_INDEX = {
+  "IT":            "^CNXIT",
+  "Banking":       "^NSEBANK",
+  "NBFC":          "^CNXFIN",
+  "Insurance":     "^CNXFIN",
+  "Oil & Gas":     "^CNXENERGY",
+  "Metals":        "^CNXMETAL",
+  "Pharma":        "^CNXPHARMA",
+  "Auto":          "^CNXAUTO",
+  "FMCG":          "^CNXFMCG",
+  "Cement":        "^CNXINFRA",
+  "Infra":         "^CNXINFRA",
+  "Capital Goods": "^CNXINFRA",
+  "Power":         "^CNXENERGY",
+  "Defence":       "^CNXPSE",
+  "Telecom":       "^CNXSERVICE",
+  "Jewellery":     "^CNXCONSUMPTION",
+  "Electronics":   "^CNXINFRA",
+  "Chemicals":     "^CNXCHEM",
+  "Healthcare":    "^CNXPHARMA",
+  "Real Estate":   "^CNXREALTY",
+  "Paint":         "^CNXCONSUMPTION",
+  "Retail":        "^CNXCONSUMPTION",
+  "Textile":       "^CNXCONSUMPTION",
+  "Food Tech":     "^CNXSERVICE",
+  "Food":          "^CNXFMCG",
+  "Hospitality":   "^CNXSERVICE",
+  "Travel":        "^CNXSERVICE",
+  "Fintech":       "^CNXFIN",
+  "Diversified":   "^NSEI",
+};
+
 // Sector → which global indices to watch, with impact direction and reason
 const SECTOR_GLOBAL_DEPS = {
   "IT": {
@@ -472,6 +505,44 @@ let _bhavMap   = null; // Map<symbol, [{date,open,high,low,close,volume}]>
 let _bhavDate  = null; // ISO date string cache was built for
 let _bhavBuild = null; // in-flight promise
 
+// Sector alignment cache: Map<yahooIndexSymbol, {isAbove, price, ema21}>
+let _sectorAlignMap  = null;
+let _sectorAlignTime = 0;
+const SECTOR_ALIGN_TTL = 4 * 60 * 60 * 1000; // 4 hours
+
+async function fetchSectorAlignment(yahooSymbol) {
+  try {
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}?interval=1d&range=3mo`;
+    const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36" } });
+    if (!res.ok) return null;
+    const json = await res.json();
+    const result = json?.chart?.result?.[0];
+    if (!result?.timestamp?.length) return null;
+    const closes = (result.indicators?.quote?.[0]?.close || []).filter(c => c != null);
+    if (closes.length < 21) return null;
+    const ema21arr = EMA.calculate({ period: 21, values: closes });
+    const ema21    = ema21arr[ema21arr.length - 1];
+    const price    = closes[closes.length - 1];
+    return { isAbove: price > ema21, price: +price.toFixed(2), ema21: +ema21.toFixed(2) };
+  } catch { return null; }
+}
+
+async function getSectorAlignMap() {
+  if (_sectorAlignMap && Date.now() - _sectorAlignTime < SECTOR_ALIGN_TTL) return _sectorAlignMap;
+  const unique = [...new Set(Object.values(SECTOR_INDEX))];
+  const map    = new Map();
+  const BATCH  = 5;
+  for (let i = 0; i < unique.length; i += BATCH) {
+    const batch   = unique.slice(i, i + BATCH);
+    const settled = await Promise.allSettled(batch.map(s => fetchSectorAlignment(s)));
+    settled.forEach((r, j) => { if (r.status === "fulfilled" && r.value) map.set(batch[j], r.value); });
+    if (i + BATCH < unique.length) await new Promise(r => setTimeout(r, 300));
+  }
+  _sectorAlignMap  = map;
+  _sectorAlignTime = Date.now();
+  return map;
+}
+
 function parseBhavZip(buf) {
   // Single-entry ZIP: local file header at offset 0
   const fnLen    = buf.readUInt16LE(26);
@@ -643,13 +714,13 @@ async function fetchGlobalQuote(yahooSymbol) {
 }
 
 // Nifty 50 daily series from Yahoo v8 chart (index not in bhavcopy)
-async function fetchNiftyDaily(months = 5) {
-  const key = `^nsei:daily:${months}`;
+async function fetchIndexDaily(yahooSymbol, months = 5) {
+  const key = `${yahooSymbol}:daily:${months}`;
   const hit = _dataCache.get(key);
   if (hit && Date.now() < hit.expiry) return hit.data;
   try {
     const range = months <= 3 ? "3mo" : months <= 6 ? "6mo" : "1y";
-    const url   = `https://query1.finance.yahoo.com/v8/finance/chart/%5ENSEI?interval=1d&range=${range}`;
+    const url   = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}?interval=1d&range=${range}`;
     const res   = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36" } });
     if (!res.ok) return [];
     const json   = await res.json();
@@ -671,6 +742,8 @@ async function fetchNiftyDaily(months = 5) {
     return data;
   } catch { return []; }
 }
+
+const fetchNiftyDaily = (months) => fetchIndexDaily("^NSEI", months);
 
 // ─── Volume Analysis ─────────────────────────────────────────────────────────
 
@@ -853,11 +926,24 @@ function calcIndicators(data) {
 // lookahead — all indicators at bar i only use data up to i) and scores every
 // past BUY signal against the app's own stopLoss/target1 levels.
 
-function backtestSignals(data, holdDays = 15) {
+function backtestSignals(data, holdDays = 15, mode = "cross-only", sectorData = null) {
   const closes  = data.map(d => d.close);
   const highs   = data.map(d => d.high);
   const lows    = data.map(d => d.low);
+  const volumes = data.map(d => d.volume);
   const len     = closes.length;
+
+  // Build date→sectorAboveEMA21 lookup if sector history provided
+  const sectorMap = new Map();
+  if (sectorData && sectorData.length >= 21) {
+    const sc    = sectorData.map(d => d.close);
+    const se21  = EMA.calculate({ period: 21, values: sc });
+    const pad21 = Array(sectorData.length - se21.length).fill(null).concat(se21);
+    sectorData.forEach((d, i) => {
+      if (pad21[i] != null) sectorMap.set(d.date, d.close > pad21[i]);
+    });
+  }
+  const hasSector = sectorMap.size > 0;
 
   const ema9arr  = EMA.calculate({ period: 9,  values: closes });
   const ema21arr = EMA.calculate({ period: 21, values: closes });
@@ -875,34 +961,54 @@ function backtestSignals(data, holdDays = 15) {
   const mc  = pad(macdArr);
   const at  = pad(atrArr);
 
+  // Precompute 20-bar avg volume (excludes current bar to avoid lookahead)
+  const avgVol20 = volumes.map((_, i) => {
+    const sl = volumes.slice(Math.max(0, i - 20), i);
+    return sl.length ? sl.reduce((a, b) => a + b, 0) / sl.length : 0;
+  });
+
   const trades     = [];
   let todaySignal  = false;
   let todayReason  = "";
   let todayMetrics = {};
+  let todayFilters = {};
 
   for (let i = 1; i < len; i++) {
     if (e50[i] == null || rs[i] == null || !mc[i] || at[i] == null) continue;
 
-    const price     = closes[i];
-    const aboveE50  = price > e50[i];
-    // Strict BUY: ALL four conditions must be true simultaneously
+    const price      = closes[i];
+    const aboveE50   = price > e50[i];
     const freshCross = e9[i] > e21[i] && e9[i-1] != null && e9[i-1] <= e21[i-1];
-    const emaOk      = e9[i] > e21[i] && aboveE50;
-    const rsiOk      = rs[i] >= 50 && rs[i] <= 68;
     const macdOk     = mc[i].MACD > mc[i].signal;
 
-    // BUY only on fresh EMA9×EMA21 bullish crossover
-    const isBuy  = freshCross;
-    const reason = `Fresh EMA9×21 cross · RSI ${rs[i].toFixed(0)} · ${macdOk ? "MACD bullish" : "MACD bearish"} · ${aboveE50 ? "Above" : "Below"} EMA50`;
+    // 4 quality filters + optional sector alignment
+    const volRatio   = avgVol20[i] > 0 ? volumes[i] / avgVol20[i] : 0;
+    const volOk      = volRatio >= 1.3;
+    const rsiRange   = rs[i] >= 45 && rs[i] <= 65;
+    const slopeOk    = i >= 3 && e9[i-3] != null && e21[i-3] != null
+                       && e9[i] > e9[i-3] && e21[i] > e21[i-3];
+    const sectorOk   = hasSector ? (sectorMap.get(data[i].date) === true) : null;
+    const filterScore = [volOk, rsiRange, slopeOk, aboveE50, hasSector ? sectorOk : null]
+                        .filter(v => v === true).length;
+
+    const isBuy = mode === "filtered"
+      ? freshCross && volOk && rsiRange   // 3 core: cross + volume + RSI
+      : freshCross;
+
+    const filterSummary = `Vol ${volRatio.toFixed(1)}x ${volOk?"✓":"✗"} · RSI ${rs[i].toFixed(0)} ${rsiRange?"✓":"✗"} · Slope ${slopeOk?"✓":"✗"} · EMA50 ${aboveE50?"✓":"✗"}`;
+    const reason = freshCross
+      ? `Fresh EMA9×21 cross · ${filterSummary} · Filter ${filterScore}/4`
+      : `RSI ${rs[i].toFixed(0)} · ${macdOk ? "MACD bullish" : "MACD bearish"} · ${aboveE50 ? "Above" : "Below"} EMA50`;
 
     if (i === len - 1) {
       todaySignal  = isBuy;
-      todayReason  = isBuy ? reason : "";
+      todayReason  = freshCross ? reason : "";
       todayMetrics = {
         ema9: +e9[i].toFixed(2), ema21: +e21[i].toFixed(2),
         ema50: +e50[i].toFixed(2), rsi: +rs[i].toFixed(1),
         macd: +mc[i].MACD.toFixed(2), macdSignal: +mc[i].signal.toFixed(2)
       };
+      todayFilters = { volOk, rsiRange, slopeOk, aboveE50, sectorOk, filterScore, freshCross, hasSector };
       continue;
     }
 
@@ -915,7 +1021,7 @@ function backtestSignals(data, holdDays = 15) {
     const sl     = +(entry - atr * 1.5).toFixed(2);
     const maxIdx = Math.min(i + holdDays, len - 1);
 
-    // Walk forward: first day HIGH >= T1 → WIN, LOW <= SL → LOSS, else TIMEOUT
+    // Walk forward: HIGH >= T1 → WIN, LOW <= SL → LOSS, else TIMEOUT
     let result = "TIMEOUT", exitPrice = closes[maxIdx], exitDate = data[maxIdx].date, exitDays = maxIdx - i;
     for (let j = i + 1; j <= maxIdx; j++) {
       if (lows[j]  <= sl) { result = "LOSS"; exitPrice = sl; exitDate = data[j].date; exitDays = j - i; break; }
@@ -926,7 +1032,7 @@ function backtestSignals(data, holdDays = 15) {
       entryDate: data[i].date, entry: +entry.toFixed(2),
       target1: t1, target2: t2, stopLoss: sl,
       exit: +exitPrice.toFixed(2), exitDate, days: exitDays,
-      result, freshCross,
+      result, freshCross, filterScore, sectorOk,
       returnPct: +(((exitPrice - entry) / entry) * 100).toFixed(2)
     });
   }
@@ -943,12 +1049,13 @@ function backtestSignals(data, holdDays = 15) {
   const avgHold  = trades.length ? +(trades.reduce((s,t) => s + t.days, 0) / trades.length).toFixed(1)    : 0;
 
   return {
-    todaySignal, todayReason, todayMetrics,
+    todaySignal, todayReason, todayMetrics, todayFilters,
+    hasSector,
+    filterDenom: hasSector ? 5 : 4,
     totalSignals: trades.length,
     wins: wins.length, losses: losses.length, timeouts: timeouts.length,
-    winRate,   // wins ÷ (wins+losses) — resolved only
-    t1Rate,    // wins ÷ all signals
-    riskReward: "1.5 : 2.0",  // SL=1.5×ATR, T1=2×ATR
+    winRate, t1Rate,
+    riskReward: "1.5 : 2.0",
     avgWin, avgLoss, avgReturn: avgRet, avgHoldDays: avgHold,
     expectancy: resolved ? +(((winRate/100)*avgWin) + ((1-winRate/100)*avgLoss)).toFixed(2) : 0,
     trades: trades.reverse()
@@ -1126,26 +1233,47 @@ function detectFreshEMACross(data, lookback = 5) {
 
   const hasCross = crossDay > -1;
 
+  // EMA slope: both EMA9 and EMA21 must be rising vs 3 bars ago
+  const ema9slope  = ema9arr.length >= 4 && ema9arr[ema9arr.length-1] > ema9arr[ema9arr.length-4];
+  const ema21slope = ema21arr.length >= 4 && ema21arr[ema21arr.length-1] > ema21arr[ema21arr.length-4];
+  const slopeOk    = ema9slope && ema21slope;
+  const rsiInRange = rsi >= 45 && rsi <= 65;
+
   const checks = {
     emaCross:      hasCross,
     rsiAbove50:    rsiOk,
+    rsiInRange,
     aboveEMA50:    price > ema50,
     macdBullish:   macd != null && macd.MACD > macd.signal,
     macdHist:      macd != null && macd.histogram > 0,
     volConfirm:    volRatio >= 1.2,
+    volSpike:      volRatio >= 1.3,
+    emaSlope:      slopeOk,
     positiveToday: closes[len - 1] > closes[len - 2],
     highVol:       volRatio >= 2.0
   };
 
   const satisfied = [];
   if (checks.emaCross)      satisfied.push(`EMA9×EMA21 (${crossDay === 1 ? "today" : crossDay === 2 ? "yesterday" : crossDay + "d ago"})`);
-  if (checks.rsiAbove50)    satisfied.push(`RSI ${rsi.toFixed(0)} > 50`);
+  if (checks.rsiInRange)    satisfied.push(`RSI ${rsi.toFixed(0)} in 45-65`);
+  else if (checks.rsiAbove50) satisfied.push(`RSI ${rsi.toFixed(0)} > 50`);
   if (checks.aboveEMA50)    satisfied.push("Above EMA50");
+  if (checks.emaSlope)      satisfied.push("EMA9&21 slope ↑");
   if (checks.macdBullish)   satisfied.push("MACD bullish");
   if (checks.macdHist)      satisfied.push("MACD histogram +ve");
-  if (checks.volConfirm)    satisfied.push(`Vol ${volRatio}x avg`);
+  if (checks.volSpike)      satisfied.push(`Vol ${volRatio}x ≥1.3×`);
+  else if (checks.volConfirm) satisfied.push(`Vol ${volRatio}x avg`);
   if (checks.positiveToday) satisfied.push("Closed green today");
   if (checks.highVol)       satisfied.push("High volume surge");
+
+  // 4 quality filters that improve backtest win rate
+  const filterChecks = {
+    volSpike:   checks.volSpike,
+    rsiInRange: checks.rsiInRange,
+    emaSlope:   checks.emaSlope,
+    aboveEMA50: checks.aboveEMA50,
+  };
+  const filterScore = Object.values(filterChecks).filter(Boolean).length;
 
   const condCount  = satisfied.length;
   const confidence = condCount >= 6 ? "HIGH" : condCount >= 4 ? "MEDIUM" : "LOW";
@@ -1166,6 +1294,8 @@ function detectFreshEMACross(data, lookback = 5) {
     confidence,
     satisfied,
     checks,
+    filterChecks,
+    filterScore,
     stopLoss:  atr ? +(price - atr * 1.5).toFixed(2) : null,
     target1:   atr ? +(price + atr * 2).toFixed(2)   : null,
     target2:   atr ? +(price + atr * 3).toFixed(2)   : null,
@@ -1298,12 +1428,46 @@ app.get("/api/stock/:symbol", async (req, res) => {
     else if (volume.scenarioType === "bearish")
       analysis.signals.push({ name: volume.scenario, type: "caution" });
 
+    // Signal Check — crossover + all 5 quality conditions
+    const cross      = detectFreshEMACross(data, 3);
+    const sector     = STOCK_SECTORS[symbol] || "Diversified";
+    const idxSym     = SECTOR_INDEX[sector]  || "^NSEI";
+    const alignMap   = await getSectorAlignMap().catch(() => new Map());
+    const sa         = alignMap.get(idxSym);
+    const sectorAbove = sa?.isAbove ?? null;
+    cross.filterChecks.sectorAligned = sectorAbove === true;
+    cross.filterScore = Object.values(cross.filterChecks).filter(Boolean).length;
+
+    const signalCheck = {
+      hasCross:      cross.hasCross,
+      crossDayLabel: cross.crossDayLabel,
+      crossDate:     cross.crossDate,
+      conditions: [
+        { label: "EMA9×21 Cross today",          value: cross.crossDayLabel,                  ok: cross.crossDay === 1,     detail: cross.crossDay === 1 ? `Today (${cross.crossDate})` : cross.hasCross ? `${cross.crossDayLabel} — not today` : "No recent cross" },
+        { label: "Volume ≥ 1.3× avg",          value: `${cross.volRatio}x`,                 ok: cross.checks.volSpike,    detail: `Vol ratio: ${cross.volRatio}x` },
+        { label: "RSI 45–65 (room to run)",     value: cross.rsi != null ? `${cross.rsi}` : "—", ok: cross.checks.rsiInRange, detail: `RSI: ${cross.rsi}` },
+        { label: "EMA9 & EMA21 slope ↑",        value: cross.checks.emaSlope ? "Rising" : "Flat/Down", ok: cross.checks.emaSlope, detail: cross.checks.emaSlope ? "Both EMAs rising (3d)" : "EMAs not both rising" },
+        { label: "Price above EMA50",           value: cross.checks.aboveEMA50 ? "Above" : "Below", ok: cross.checks.aboveEMA50, detail: `EMA50: ₹${cross.ema50}` },
+        { label: `${sector} sector above EMA21`, value: sectorAbove === null ? "No data" : sectorAbove ? "Above" : "Below", ok: sectorAbove === true, detail: sa ? `${idxSym}: ₹${sa.price} / EMA21 ₹${sa.ema21}` : "Sector data unavailable", na: sectorAbove === null },
+      ],
+      filterScore:  cross.filterScore,
+      filterDenom:  5,
+      // Core signal: cross must be TODAY (crossDay===1) + volume + RSI
+      coreSignal: cross.crossDay === 1 && cross.checks.volSpike && cross.checks.rsiInRange,
+      verdict: cross.crossDay === 1 && cross.checks.volSpike && cross.checks.rsiInRange
+             ? (cross.filterScore >= 4 ? "STRONG BUY" : "BUY")
+             : "NO SIGNAL",
+      stopLoss: cross.stopLoss,
+      target1:  cross.target1,
+      target2:  cross.target2,
+    };
+
     const sectorInfo = getSectorInfo(symbol);
     res.json({
       symbol, price, change, changePct, sectorInfo, high52w, low52w,
       todayOpen, todayHigh, todayLow,
       liveQuote: liveQuote ? { source: liveQuote.source, isMarketOpen: liveQuote.isMarketOpen } : null,
-      volume, ...analysis
+      volume, ...analysis, signalCheck
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1314,15 +1478,45 @@ app.get("/api/stock/:symbol", async (req, res) => {
 app.get("/api/backtest/:symbol", async (req, res) => {
   try {
     const symbol   = req.params.symbol.toUpperCase().replace(/\.NS$/i, "");
-    const months   = parseInt(req.query.months   || "24");
+    const months   = parseInt(req.query.months   || "12");
     const holdDays = parseInt(req.query.holdDays || "15");
 
     const data = await fetchNSEData(symbol, months);
     if (!data || data.length < 80)
       return res.status(404).json({ error: `Not enough history for ${symbol} to backtest` });
 
-    const result = backtestSignals(data, holdDays);
-    res.json({ symbol, months, holdDays, ...result });
+    const sector     = STOCK_SECTORS[symbol] || "Diversified";
+    const idxSym     = SECTOR_INDEX[sector]  || "^NSEI";
+    // Fetch sector index history (same window) for bar-by-bar alignment in backtest
+    const sectorData = await fetchIndexDaily(idxSym, months).catch(() => null);
+    const crossOnly  = backtestSignals(data, holdDays, "cross-only", sectorData);
+    const filtered   = backtestSignals(data, holdDays, "filtered",   sectorData);
+    // Current sector alignment for today's banner
+    const alignMap   = await getSectorAlignMap().catch(() => new Map());
+    const sa         = alignMap.get(idxSym);
+    res.json({ symbol, months, holdDays, ...crossOnly, filtered,
+      sector, sectorIndex: idxSym,
+      sectorAligned: sa?.isAbove ?? null,
+      sectorEMA21:   sa?.ema21   ?? null,
+      sectorPrice:   sa?.price   ?? null });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Backtest Nifty 50 index — same fresh EMA9×21 cross logic on daily index data
+app.get("/api/backtest-nifty", async (req, res) => {
+  try {
+    const months   = parseInt(req.query.months   || "12");
+    const holdDays = parseInt(req.query.holdDays || "15");
+
+    const data = await fetchNiftyDaily(months);
+    if (!data || data.length < 80)
+      return res.status(503).json({ error: "Not enough Nifty data to backtest" });
+
+    const crossOnly = backtestSignals(data, holdDays, "cross-only");
+    const filtered  = backtestSignals(data, holdDays, "filtered");
+    res.json({ symbol: "NIFTY 50", months, holdDays, ...crossOnly, filtered });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -1342,6 +1536,24 @@ app.get("/api/scan", async (req, res) => {
   const results      = [];
   const BATCH        = 5;
 
+  // Fetch sector EMA21 alignment once for the whole scan (cached 4h)
+  const sectorAlignMap = await getSectorAlignMap().catch(() => new Map());
+
+  function attachSectorAlignment(cross, symbol) {
+    const sector        = STOCK_SECTORS[symbol] || "Diversified";
+    const idxSym        = SECTOR_INDEX[sector]  || "^NSEI";
+    const sa            = sectorAlignMap.get(idxSym);
+    cross.sectorName    = sector;
+    cross.sectorIndex   = idxSym;
+    cross.sectorAligned = sa?.isAbove ?? null;
+    cross.sectorEMA21   = sa?.ema21   ?? null;
+    cross.sectorPrice   = sa?.price   ?? null;
+    // Extend filterChecks with sector (null = data unavailable, treated as false)
+    cross.filterChecks.sectorAligned = sa?.isAbove === true;
+    cross.filterScore = Object.values(cross.filterChecks).filter(Boolean).length;
+    return cross;
+  }
+
   for (let i = 0; i < stocks.length; i += BATCH) {
     const batch    = stocks.slice(i, i + BATCH);
     const batchRes = await Promise.allSettled(
@@ -1354,7 +1566,7 @@ app.get("/api/scan", async (req, res) => {
         if (price < priceMin || price > priceMax) return null;
 
         // Always compute cross stats — used in every universe's table
-        const cross = detectFreshEMACross(data, 5);
+        const cross = attachSectorAlignment(detectFreshEMACross(data, 5), symbol);
 
         // Crossover universe: only keep stocks with fresh EMA9×EMA21 + RSI>50
         if (isCrossover) {
@@ -1362,7 +1574,7 @@ app.get("/api/scan", async (req, res) => {
           const volume = analyzeVolume(data);
           return {
             symbol, price, cross,
-            signal:     cross.condCount >= 5 ? "STRONG BUY" : cross.condCount >= 3 ? "BUY" : "WATCH",
+            signal:     cross.filterScore >= 4 ? "STRONG BUY" : cross.filterScore >= 2 ? "BUY" : "WATCH",
             riskLevels: { stopLoss: cross.stopLoss, target1: cross.target1, target2: cross.target2 },
             volume: {
               ratio:        volume.ratio,
@@ -1392,7 +1604,7 @@ app.get("/api/scan", async (req, res) => {
           rsi:         analysis.current.rsi?.toFixed(1),
           riskLevels:  analysis.riskLevels,
           breakout,
-          cross,       // always included now
+          cross,
           volume: {
             ratio:        volume.ratio,
             ratioText:    volume.ratioText,

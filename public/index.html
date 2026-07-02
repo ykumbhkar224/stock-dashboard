@@ -1043,6 +1043,14 @@
       </div>
     </div>
 
+    <!-- Nifty Backtest -->
+    <div class="nifty-section card">
+      <div class="nifty-section-title">📊 Nifty EMA9×21 Cross Backtest <span style="font-size:11px;font-weight:400;color:#475569;text-transform:none;margin-left:6px">1 year · daily · fresh cross only</span></div>
+      <div id="niftyBacktestPanel">
+        <div class="loading-overlay"><div class="spinner"></div><p>Running backtest…</p></div>
+      </div>
+    </div>
+
     <!-- Virtual Trading -->
     <div class="nifty-section card" id="vtSection">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:8px">
@@ -1181,6 +1189,82 @@
       return m[scenario] || "📊";
     }
 
+    function renderSignalCheck(sc) {
+      if (!sc) return "";
+
+      const v       = sc.verdict;
+      const isBuy   = v === "STRONG BUY" || v === "BUY";
+      const vColor  = v === "STRONG BUY" ? "#4ade80" : v === "BUY" ? "#86efac" : "#475569";
+      const vBg     = isBuy ? "rgba(74,222,128,.07)" : "rgba(71,85,105,.05)";
+      const vBorder = isBuy ? "rgba(74,222,128,.28)" : "rgba(71,85,105,.18)";
+      const vIcon   = v === "STRONG BUY" ? "🟢" : v === "BUY" ? "🟢" : "⚫";
+
+      // Split: first 3 = core signal, rest = quality filters
+      const core    = sc.conditions.slice(0, 3);
+      const quality = sc.conditions.slice(3);
+      const total   = sc.conditions.length;
+      const passed  = sc.conditions.filter(c => c.ok).length;
+
+      function condRow(cond, isCore) {
+        const na   = cond.na === true;
+        const col  = na ? "#64748b" : cond.ok ? "#4ade80" : "#f87171";
+        const icon = na ? "—" : cond.ok ? "✓" : "✗";
+        const bg   = na ? "rgba(100,116,139,.06)" : cond.ok ? "rgba(74,222,128,.07)" : "rgba(248,113,113,.06)";
+        const tag  = isCore
+          ? `<span style="font-size:9px;background:rgba(56,189,248,.12);color:#38bdf8;padding:1px 5px;border-radius:3px;margin-right:4px">SIGNAL</span>`
+          : `<span style="font-size:9px;background:rgba(167,139,250,.1);color:#a78bfa;padding:1px 5px;border-radius:3px;margin-right:4px">QUALITY</span>`;
+        return `<div style="display:flex;align-items:center;gap:10px;padding:7px 10px;border-radius:7px;background:${bg};margin-bottom:4px">
+          <span style="font-size:15px;font-weight:700;color:${col};width:18px;text-align:center">${icon}</span>
+          <span style="flex:1;font-size:13px;color:#e2e8f0">${tag}${cond.label}</span>
+          <span style="font-size:12px;color:${col};font-weight:600">${cond.detail}</span>
+        </div>`;
+      }
+
+      const levels = isBuy && sc.stopLoss
+        ? `<div style="display:flex;gap:10px;margin-top:10px;flex-wrap:wrap">
+            <div style="background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.3);border-radius:6px;padding:6px 14px;text-align:center">
+              <div style="color:#64748b;font-size:10px">STOP LOSS</div>
+              <div style="color:#f87171;font-weight:700">₹${sc.stopLoss}</div>
+            </div>
+            <div style="background:rgba(74,222,128,.1);border:1px solid rgba(74,222,128,.3);border-radius:6px;padding:6px 14px;text-align:center">
+              <div style="color:#64748b;font-size:10px">TARGET 1</div>
+              <div style="color:#4ade80;font-weight:700">₹${sc.target1}</div>
+            </div>
+            <div style="background:rgba(74,222,128,.07);border:1px solid rgba(74,222,128,.2);border-radius:6px;padding:6px 14px;text-align:center">
+              <div style="color:#64748b;font-size:10px">TARGET 2</div>
+              <div style="color:#86efac;font-weight:700">₹${sc.target2}</div>
+            </div>
+          </div>` : "";
+
+      return `<div style="background:${vBg};border:1px solid ${vBorder};border-radius:10px;padding:14px 16px;margin-bottom:16px">
+
+        <!-- Header -->
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:8px">
+          <div style="font-size:14px;font-weight:700;color:#e2e8f0">Signal Conditions</div>
+          <div style="display:flex;align-items:center;gap:12px">
+            <div style="text-align:right">
+              <div style="font-size:18px;font-weight:800;color:${passed>=4?"#4ade80":passed>=2?"#f59e0b":"#f87171"}">${passed}<span style="font-size:12px;color:#475569;font-weight:400">/${total}</span></div>
+              <div style="font-size:10px;color:#475569">conditions met</div>
+              <div style="width:72px;height:4px;background:#1e293b;border-radius:2px;margin-top:3px;margin-left:auto">
+                <div style="height:4px;background:${passed>=4?"#4ade80":passed>=2?"#f59e0b":"#f87171"};border-radius:2px;width:${Math.round(passed/total*100)}%"></div>
+              </div>
+            </div>
+            <div style="font-size:14px;font-weight:800;color:${vColor};padding:6px 14px;border-radius:7px;border:1px solid ${vBorder};background:${vBg}">${vIcon} ${v}</div>
+          </div>
+        </div>
+
+        <!-- Core signal conditions (3) -->
+        <div style="font-size:10px;color:#38bdf8;font-weight:600;letter-spacing:.06em;margin-bottom:5px">SIGNAL CONDITIONS — all 3 required</div>
+        ${core.map(c => condRow(c, true)).join("")}
+
+        <!-- Quality filters (remaining) -->
+        <div style="font-size:10px;color:#a78bfa;font-weight:600;letter-spacing:.06em;margin:10px 0 5px">QUALITY FILTERS — higher score = stronger setup</div>
+        ${quality.map(c => condRow(c, false)).join("")}
+
+        ${levels}
+      </div>`;
+    }
+
     function renderStock(d) {
       const chgClass = d.change >= 0 ? "change-pos" : "change-neg";
       const chgSign  = d.change >= 0 ? "+" : "";
@@ -1199,6 +1283,8 @@
             </div>
             <span class="signal-badge ${sigBadgeClass(d.signal)}">${d.signal}</span>
           </div>
+
+          ${renderSignalCheck(d.signalCheck)}
 
           <div class="indicators-grid">
             <div class="ind-box"><div class="ind-label">EMA 9</div><div class="ind-value">${Number(c.ema9).toFixed(2)}</div></div>
@@ -1318,50 +1404,104 @@
       }
     }
 
-    function renderBacktest(bt) {
-      const panel = document.getElementById("backtestPanel");
+    function renderBacktest(bt, panel) {
+      if (!panel) panel = document.getElementById("backtestPanel");
       if (!panel) return;
 
-      if (bt.totalSignals === 0) {
-        panel.innerHTML = `<div style="color:#94a3b8;font-size:13px;padding:12px">No BUY signals fired in the last ${bt.months} months — not enough qualifying setups yet.</div>`;
+      const f   = bt.filtered || {};        // filtered mode stats
+      const tf  = bt.todayFilters || {};     // today's filter breakdown
+
+      // Sector alignment line for banner
+      const sectorLine = bt.sector
+        ? (() => {
+            const sa = bt.sectorAligned;
+            const col= sa===true?"#4ade80":sa===false?"#f87171":"#64748b";
+            const icon= sa===true?"✓":sa===false?"✗":"—";
+            return `<div style="margin-top:5px;font-size:11.5px;color:${col}">
+              ${icon} Sector: <b>${bt.sector}</b> index ${sa===true?"above":"below"} EMA21
+              ${bt.sectorEMA21?`<span style="color:#475569"> (price ₹${bt.sectorPrice} / EMA21 ₹${bt.sectorEMA21})</span>`:""}
+            </div>`;
+          })()
+        : "";
+
+      // Today's signal: check filtered first (high confidence), then cross-only
+      let todayBanner = "";
+      if (f.todaySignal) {
+        todayBanner = `<div style="padding:12px 14px;background:#052e16;border:1px solid #166534;border-radius:8px;margin-bottom:12px">
+          <div style="color:#4ade80;font-weight:700;font-size:14px">🟢 HIGH CONFIDENCE BUY signal today — all 4 quality filters met</div>
+          <div style="color:#86efac;font-size:12px;margin-top:4px">${f.todayReason || bt.todayReason}</div>
+          ${sectorLine}
+          <div style="color:#4ade80;font-size:11.5px;margin-top:6px">
+            Filtered win rate: <b>${f.winRate}%</b> · avg +${f.avgWin}% win / ${f.avgLoss}% loss · expectancy <b>${f.expectancy>=0?'+':''}${f.expectancy}%</b>
+          </div>
+        </div>`;
+      } else if (bt.todaySignal && tf.freshCross) {
+        const score = tf.filterScore ?? 0;
+        const fc = tf;
+        const pills = [
+          { l:`Vol ${fc.volOk?"✓":"✗"}`, ok: fc.volOk },
+          { l:`RSI ${fc.rsiRange?"✓":"✗"}`, ok: fc.rsiRange },
+          { l:`Slope ${fc.slopeOk?"✓":"✗"}`, ok: fc.slopeOk },
+          { l:`EMA50 ${fc.aboveE50?"✓":"✗"}`, ok: fc.aboveE50 },
+        ].map(p=>`<span style="font-size:11px;padding:2px 7px;border-radius:4px;background:${p.ok?"rgba(74,222,128,.15)":"rgba(248,113,113,.12)"};color:${p.ok?"#4ade80":"#f87171"}">${p.l}</span>`).join(" ");
+        todayBanner = `<div style="padding:12px 14px;background:#1c1205;border:1px solid #854d0e;border-radius:8px;margin-bottom:12px">
+          <div style="color:#fbbf24;font-weight:700;font-size:14px">🟡 Fresh cross today — ${score}/5 quality filters met</div>
+          <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">${pills}</div>
+          ${sectorLine}
+          <div style="color:#78716c;font-size:11.5px;margin-top:6px">
+            Cross-only win rate: ${bt.winRate}% · Filtered win rate: ${f.winRate||"—"}% (requires all 4 filters)
+          </div>
+        </div>`;
+      } else {
+        todayBanner = `<div style="padding:10px 14px;background:#0f172a;border:1px solid #1e293b;border-radius:8px;margin-bottom:12px;color:#64748b;font-size:12.5px">
+          No fresh EMA9×21 cross today.
+        </div>`;
+      }
+
+      // Comparison grid: Cross-Only vs Filtered
+      const mkWinC  = v => v >= 60 ? "#4ade80" : v >= 45 ? "#fbbf24" : "#f87171";
+      const mkExpC  = v => v >= 0 ? "#4ade80" : "#f87171";
+      const comparison = bt.totalSignals === 0 && (!f.totalSignals) ? "" : `
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px">
+          <div style="background:#0f172a;border:1px solid #1e293b;border-radius:8px;padding:12px">
+            <div style="color:#64748b;font-size:11px;margin-bottom:8px;font-weight:600">CROSS ONLY (baseline)</div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
+              <div><div style="color:#475569;font-size:10px">Signals</div><div style="font-weight:700">${bt.totalSignals}</div></div>
+              <div><div style="color:#475569;font-size:10px">W/L/T</div><div style="font-weight:600;font-size:12px">${bt.wins}/${bt.losses}/${bt.timeouts}</div></div>
+              <div><div style="color:#475569;font-size:10px">Win Rate</div><div style="font-weight:700;color:${mkWinC(bt.winRate)}">${bt.winRate}%</div></div>
+              <div><div style="color:#475569;font-size:10px">Expectancy</div><div style="font-weight:700;color:${mkExpC(bt.expectancy)}">${bt.expectancy>=0?'+':''}${bt.expectancy}%</div></div>
+            </div>
+          </div>
+          <div style="background:#0a1628;border:1px solid #1e3a5f;border-radius:8px;padding:12px">
+            <div style="color:#38bdf8;font-size:11px;margin-bottom:8px;font-weight:600">FILTERED (CROSS + VOL + RSI) ✦</div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">
+              <div><div style="color:#475569;font-size:10px">Signals</div><div style="font-weight:700">${f.totalSignals??0}</div></div>
+              <div><div style="color:#475569;font-size:10px">W/L/T</div><div style="font-weight:600;font-size:12px">${f.wins??0}/${f.losses??0}/${f.timeouts??0}</div></div>
+              <div><div style="color:#475569;font-size:10px">Win Rate</div><div style="font-weight:700;color:${mkWinC(f.winRate??0)}">${f.winRate??0}%</div></div>
+              <div><div style="color:#475569;font-size:10px">Expectancy</div><div style="font-weight:700;color:${mkExpC(f.expectancy??0)}">${(f.expectancy??0)>=0?'+':''}${f.expectancy??0}%</div></div>
+            </div>
+          </div>
+        </div>
+        <div style="font-size:11px;color:#475569;margin-bottom:10px">
+          ✦ Filtered signal: Cross + Vol ≥1.3× + RSI 45–65 · Quality score shows slope/EMA50/sector met per trade
+        </div>`;
+
+      if (bt.totalSignals === 0 && (!f || f.totalSignals === 0)) {
+        panel.innerHTML = todayBanner + `<div style="color:#94a3b8;font-size:13px;padding:4px">No BUY signals fired in the last ${bt.months} months.</div>`;
         return;
       }
 
-      const winC  = bt.winRate >= 60 ? "#4ade80" : bt.winRate >= 45 ? "#fbbf24" : "#f87171";
-      const expC  = bt.expectancy >= 0 ? "#4ade80" : "#f87171";
-      const rrNum = bt.riskReward || "1.5 : 2.0";
+      // Show filtered trades if available, else cross-only
+      const showTrades = (f.totalSignals > 0 ? f : bt).trades || bt.trades;
+      const showLabel  = f.totalSignals > 0 ? "Filtered trades" : "Cross-only trades";
 
-      // Today's signal banner
-      const todayBanner = bt.todaySignal
-        ? `<div style="padding:12px 14px;background:#052e16;border:1px solid #166534;border-radius:8px;margin-bottom:12px">
-            <div style="color:#4ade80;font-weight:700;font-size:14px">🟢 BUY signal active today</div>
-            <div style="color:#86efac;font-size:12px;margin-top:4px">${bt.todayReason}</div>
-            <div style="color:#4ade80;font-size:11.5px;margin-top:6px">
-              Historical performance: <b>${bt.winRate}%</b> win rate (T1 hit) · avg +${bt.avgWin}% win / ${bt.avgLoss}% loss · expectancy <b>${bt.expectancy>=0?'+':''}${bt.expectancy}%</b> per trade
-            </div>
-          </div>`
-        : `<div style="padding:10px 14px;background:#0f172a;border:1px solid #1e293b;border-radius:8px;margin-bottom:12px;color:#64748b;font-size:12.5px">
-            No BUY signal today — conditions (EMA9>21, RSI 50–68, MACD bullish, above EMA50) not all met.
-          </div>`;
-
-      // Stats row
-      const stats = `
-        <div class="indicators-grid" style="margin-bottom:12px">
-          <div class="ind-box"><div class="ind-label">Total BUY Signals</div><div class="ind-value">${bt.totalSignals}</div></div>
-          <div class="ind-box"><div class="ind-label">Win / Loss / Timeout</div><div class="ind-value">${bt.wins} / ${bt.losses} / ${bt.timeouts}</div></div>
-          <div class="ind-box"><div class="ind-label">Win Rate (T1 hit)</div><div class="ind-value" style="color:${winC}">${bt.winRate}%</div></div>
-          <div class="ind-box"><div class="ind-label">Avg Win / Avg Loss</div><div class="ind-value">+${bt.avgWin}% / ${bt.avgLoss}%</div></div>
-          <div class="ind-box"><div class="ind-label">Risk:Reward Ratio</div><div class="ind-value">${rrNum}</div></div>
-          <div class="ind-box"><div class="ind-label">Expectancy/Trade</div><div class="ind-value" style="color:${expC}">${bt.expectancy>=0?'+':''}${bt.expectancy}%</div></div>
-        </div>`;
-
-      // Trade rows — entry / T1 / SL / exit / days / result / return
-      const rows = bt.trades.map(t => {
+      const rows = showTrades.map(t => {
         const rc  = t.result === "WIN" ? "#4ade80" : t.result === "LOSS" ? "#f87171" : "#94a3b8";
         const ret = t.returnPct >= 0 ? `<span style="color:#4ade80">+${t.returnPct}%</span>` : `<span style="color:#f87171">${t.returnPct}%</span>`;
-        const cross = t.freshCross ? `<span style="color:#fbbf24;font-size:10px"> ✦CROSS</span>` : "";
+        const fd  = bt.filterDenom ?? (bt.sector ? 5 : 4);
+        const fsc = t.filterScore != null ? `<span style="color:${t.filterScore>=fd?"#4ade80":t.filterScore>=(fd-2)?"#f59e0b":"#64748b"};font-size:10px"> ${t.filterScore}/${fd}</span>` : "";
         return `<tr>
-          <td style="color:#94a3b8">${t.entryDate}${cross}</td>
+          <td style="color:#94a3b8">${t.entryDate}${fsc}</td>
           <td>₹${t.entry}</td>
           <td style="color:#4ade80">₹${t.target1}</td>
           <td style="color:#f87171">₹${t.stopLoss}</td>
@@ -1375,7 +1515,8 @@
 
       panel.innerHTML = `
         ${todayBanner}
-        ${stats}
+        ${comparison}
+        <div style="color:#64748b;font-size:11px;margin-bottom:6px">${showLabel} (${showTrades.length})</div>
         <div style="overflow-x:auto">
           <table class="vt-table">
             <thead>
@@ -1388,9 +1529,7 @@
           </table>
         </div>
         <div style="margin-top:8px;font-size:11px;color:#475569">
-          Signal: fresh EMA9×EMA21 bullish crossover (1 year data, daily candles) ·
-          WIN = T1 hit (HIGH ≥ T1=entry+2×ATR) · LOSS = SL hit (LOW ≤ SL=entry−1.5×ATR) · TIMEOUT = neither in ${bt.holdDays}d.
-          Past performance ≠ future results.
+          WIN = T1 hit (entry+2×ATR) · LOSS = SL hit (entry−1.5×ATR) · TIMEOUT = neither in ${bt.holdDays}d · Past performance ≠ future results.
         </div>`;
     }
 
@@ -1873,11 +2012,11 @@
         return `<tr>
           ${h("Symbol","symbol")}${h("Price","price")}
           ${h("Cross When","crossDay","color:#a78bfa")}
-          ${h("Conds","condCount","color:#a78bfa")}${h("Conf","condCount")}
+          ${h("Filter","condCount","color:#38bdf8")}
+          ${h("Conf","condCount")}
           ${h("RSI","rsi")}
-          ${h("EMA9","ema9")}${h("EMA21","ema21")}
           ${h("Vol Ratio","volRatio")}
-          <th>Why</th>
+          <th>Quality Conditions</th>
           ${h("Stop Loss","stopLoss")}${h("Target 1","target1")}
         </tr>`;
       }
@@ -1913,11 +2052,25 @@
           const c  = r.cross || {};
           const cc = c.crossDay === 1 ? "today" : c.crossDay === 2 ? "yest" : "older";
           const cf = `conf-${c.confidence}`;
-          const pills = (c.satisfied || []).slice(0, 4).map(s =>
-            `<span class="cond-pill">${s}</span>`).join("");
           const vcol  = (c.volRatio||0) >= 2 ? "#4ade80" : (c.volRatio||0) >= 1.3 ? "#f59e0b" : "#94a3b8";
-          const e50c  = r.price > (c.ema50||0) ? "#4ade80" : "#f87171";
-          const ccol  = (c.condCount||0)>=5?"#4ade80":(c.condCount||0)>=3?"#f59e0b":"#94a3b8";
+          const fk    = c.filterChecks || {};
+          const fs    = c.filterScore ?? 0;
+          const fsCol = fs >= 5 ? "#4ade80" : fs >= 4 ? "#38bdf8" : fs >= 3 ? "#f59e0b" : "#f87171";
+          const sectorLabel = c.sectorName ? `${c.sectorName}` : "Sector";
+          const sectorOk    = c.sectorAligned === true;
+          const sectorNA    = c.sectorAligned === null;
+          const filterPills = [
+            { l: `Vol ${c.volRatio??0}x`,    ok: fk.volSpike },
+            { l: `RSI ${c.rsi??0}`,          ok: fk.rsiInRange },
+            { l: "Slope ↑",                   ok: fk.emaSlope },
+            { l: "EMA50",                     ok: fk.aboveEMA50 },
+            { l: sectorLabel,                  ok: sectorOk, na: sectorNA },
+          ].map(p => {
+            const bg  = p.na ? "rgba(100,116,139,.1)" : p.ok ? "rgba(74,222,128,.12)" : "rgba(248,113,113,.10)";
+            const col = p.na ? "#64748b" : p.ok ? "#4ade80" : "#f87171";
+            const icon= p.na ? "—" : p.ok ? "✓" : "✗";
+            return `<span style="font-size:10px;padding:2px 6px;border-radius:3px;white-space:nowrap;background:${bg};color:${col}">${icon} ${p.l}</span>`;
+          }).join(" ");
           return `<tr onclick="goToStock('${r.symbol}')">
             <td><span class="sym-link">${r.symbol}</span></td>
             <td>₹${Number(r.price).toFixed(2)}</td>
@@ -1926,18 +2079,18 @@
               <div style="font-size:9px;color:#475569;margin-top:2px">${c.crossDate||""}</div>
             </td>
             <td>
-              <span style="font-size:17px;font-weight:800;color:${ccol}">${c.condCount??0}</span>
-              <span style="color:#334155;font-size:10px">/8</span>
-              <div style="height:3px;background:#0f172a;border-radius:2px;width:40px;margin-top:2px">
-                <div style="height:3px;background:${ccol};border-radius:2px;width:${Math.round((c.condCount??0)/8*100)}%"></div>
+              <span style="font-size:18px;font-weight:800;color:${fsCol}">${fs}</span>
+              <span style="color:#334155;font-size:10px">/5</span>
+              <div style="height:3px;background:#0f172a;border-radius:2px;width:36px;margin-top:2px">
+                <div style="height:3px;background:${fsCol};border-radius:2px;width:${fs*20}%"></div>
               </div>
             </td>
             <td><span class="conf-badge ${cf}">${c.confidence}</span></td>
-            <td style="color:${(c.rsi||0)>68?"#f87171":(c.rsi||0)<50?"#f59e0b":"#4ade80"};font-weight:600">${c.rsi??""}</td>
-            <td style="color:#f43f5e;font-size:11px">${c.ema9??""}</td>
-            <td style="color:#f59e0b;font-size:11px">${c.ema21??""}</td>
+            <td style="color:${(c.rsi||0)>65?"#f87171":(c.rsi||0)<45?"#f59e0b":"#4ade80"};font-weight:600">${c.rsi??""}</td>
             <td style="color:${vcol};font-weight:600">${c.volRatio!=null?c.volRatio+"x":"—"}</td>
-            <td style="font-size:10px;max-width:180px">${pills}</td>
+            <td style="font-size:10px;max-width:220px">
+              <div style="display:flex;flex-wrap:wrap;gap:3px">${filterPills}</div>
+            </td>
             <td style="color:#f87171">₹${r.riskLevels?.stopLoss??"—"}</td>
             <td style="color:#4ade80">₹${r.riskLevels?.target1??"—"}</td>
           </tr>`;
@@ -1956,6 +2109,18 @@
           const cx  = r.cross || {};
           const cxc = cx.crossDay===1?"today":cx.crossDay===2?"yest":cx.hasCross?"older":"";
           const ccc = (cx.condCount||0)>=6?"#4ade80":(cx.condCount||0)>=4?"#f59e0b":"#475569";
+          const bfk = cx.filterChecks || {};
+          const bfs = cx.filterScore ?? 0;
+          const bfsC = bfs>=5?"#4ade80":bfs>=4?"#38bdf8":bfs>=3?"#f59e0b":"#f87171";
+          const bfPills = [
+            { l:`Vol`,ok:bfk.volSpike },{ l:`RSI`,ok:bfk.rsiInRange },
+            { l:`Slope`,ok:bfk.emaSlope },{ l:`EMA50`,ok:bfk.aboveEMA50 },
+            { l:cx.sectorName?cx.sectorName.slice(0,6):`Sec`, ok:bfk.sectorAligned, na:cx.sectorAligned===null },
+          ].map(p=>{
+            const col=p.na?"#475569":p.ok?"#4ade80":"#f87171";
+            const bg=p.na?"rgba(100,116,139,.08)":p.ok?"rgba(74,222,128,.12)":"rgba(248,113,113,.08)";
+            return `<span style="font-size:9px;padding:1px 4px;border-radius:3px;background:${bg};color:${col}">${p.na?"—":p.ok?"✓":"✗"}${p.l}</span>`;
+          }).join(" ");
           return `<tr onclick="goToStock('${r.symbol}')">
             <td><span class="sym-link">${r.symbol}</span></td>
             <td>₹${Number(r.price).toFixed(2)}</td>
@@ -1965,7 +2130,10 @@
             </td>
             <td style="font-size:11px;white-space:nowrap">${bo.pattern||"—"}</td>
             <td>${cx.hasCross?`<span class="cross-badge ${cxc}" style="font-size:10px">${cx.crossDayLabel}</span>`:`<span style="color:#334155">—</span>`}</td>
-            <td><span style="font-weight:700;color:${ccc}">${cx.condCount??0}/8</span></td>
+            <td>
+              <span style="font-weight:700;color:${bfsC}">${bfs}/5</span>
+              <div style="margin-top:3px;display:flex;gap:2px;flex-wrap:wrap">${bfPills}</div>
+            </td>
             <td style="color:#f87171;font-size:12px">${bo.resistance?"₹"+bo.resistance:"—"}</td>
             <td style="color:${vc};font-weight:600">${bo.volRatio!=null?bo.volRatio+"x":"—"}${bp}</td>
             <td style="color:${(bo.rsi||0)>68?"#f87171":(bo.rsi||0)<45?"#f59e0b":"#4ade80"}">${bo.rsi??r.rsi??""}</td>
@@ -1990,6 +2158,18 @@
         const cx = r.cross || {};
         const cc = cx.crossDay===1?"today":cx.crossDay===2?"yest":cx.hasCross?"older":"";
         const gc = (cx.condCount||0)>=6?"#4ade80":(cx.condCount||0)>=4?"#f59e0b":"#475569";
+        const sfk = cx.filterChecks || {};
+        const sfs = cx.filterScore ?? 0;
+        const sfsC = sfs>=5?"#4ade80":sfs>=4?"#38bdf8":sfs>=3?"#f59e0b":"#f87171";
+        const sfPills = [
+          { l:`Vol`,ok:sfk.volSpike },{ l:`RSI`,ok:sfk.rsiInRange },
+          { l:`Slope`,ok:sfk.emaSlope },{ l:`EMA50`,ok:sfk.aboveEMA50 },
+          { l:cx.sectorName?cx.sectorName.slice(0,6):`Sec`, ok:sfk.sectorAligned, na:cx.sectorAligned===null },
+        ].map(p=>{
+          const col=p.na?"#475569":p.ok?"#4ade80":"#f87171";
+          const bg=p.na?"rgba(100,116,139,.08)":p.ok?"rgba(74,222,128,.12)":"rgba(248,113,113,.08)";
+          return `<span style="font-size:9px;padding:1px 4px;border-radius:3px;background:${bg};color:${col}">${p.na?"—":p.ok?"✓":"✗"}${p.l}</span>`;
+        }).join(" ");
         return `<tr onclick="goToStock('${r.symbol}')">
           <td><span class="sym-link">${r.symbol}</span></td>
           <td>₹${Number(r.price).toFixed(2)}</td>
@@ -1997,7 +2177,10 @@
           <td><div class="signal-count">${dots}</div></td>
           <td>${chips}</td>
           <td>${cx.hasCross?`<span class="cross-badge ${cc}" style="font-size:10px">${cx.crossDayLabel}</span>`:`<span style="color:#334155;font-size:11px">—</span>`}</td>
-          <td><span style="font-weight:700;color:${gc}">${cx.condCount??0}/8</span></td>
+          <td>
+            <span style="font-weight:700;color:${sfsC}">${sfs}/5</span>
+            <div style="margin-top:3px;display:flex;gap:2px;flex-wrap:wrap">${sfPills}</div>
+          </td>
           <td style="color:${vc};font-weight:600">${v.ratioText||""}${bp}</td>
           <td style="font-size:12px;color:#94a3b8">${v.scenario||""}</td>
           <td>${ob} ${v.obvTrend||""}</td>
@@ -2472,6 +2655,20 @@
       renderNiftySignalBox(data.signal);
       renderNiftyKeyLevels(data.signal);
       loadOptionChain(false);
+      loadNiftyBacktest();
+    }
+
+    async function loadNiftyBacktest() {
+      const panel = document.getElementById("niftyBacktestPanel");
+      if (!panel) return;
+      try {
+        const res = await fetch("/api/backtest-nifty?months=12&holdDays=15");
+        const bt  = await res.json();
+        if (bt.error) throw new Error(bt.error);
+        renderBacktest(bt, panel);
+      } catch(e) {
+        panel.innerHTML = `<div class="error-box">Backtest failed: ${e.message}</div>`;
+      }
     }
 
     function renderNiftyGlobalStrip(indices, sentiment) {
