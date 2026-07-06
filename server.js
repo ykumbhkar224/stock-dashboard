@@ -1638,6 +1638,132 @@ app.get("/api/scan", async (req, res) => {
   res.json({ universe, label: u.label, total: stocks.length, count: results.length, results, isBreakout, isCrossover });
 });
 
+// ─── Resilience Scanner ───────────────────────────────────────────────────────
+// Finds stocks that hold flat or rise while Nifty is falling.
+// These stocks show institutional accumulation and often lead the next rally.
+
+app.get("/api/scan-resilience", async (req, res) => {
+  const universe  = req.query.universe || "nifty200";
+  const period    = req.query.period   || "1d";  // "1d" or "5d"
+  const u = UNIVERSES[universe] || UNIVERSES["nifty200"];
+  const stocks = u.stocks;
+  const BATCH = 6;
+
+  // 1. Fetch Nifty recent data for baseline
+  const niftyData = await fetchIndexDaily("^NSEI", 2).catch(() => null);
+  if (!niftyData || niftyData.length < 6)
+    return res.json({ error: "Could not fetch Nifty data" });
+
+  const niftyLen    = niftyData.length;
+  const niftyClose  = niftyData[niftyLen - 1].close;
+  const niftyPrev1  = niftyData[niftyLen - 2].close;
+  const niftyPrev5  = niftyData[Math.max(0, niftyLen - 6)].close;
+  const niftyChg1d  = +((niftyClose - niftyPrev1) / niftyPrev1 * 100).toFixed(2);
+  const niftyChg5d  = +((niftyClose - niftyPrev5) / niftyPrev5 * 100).toFixed(2);
+  const niftyChg    = period === "5d" ? niftyChg5d : niftyChg1d;
+
+  // Market must be meaningfully down to run resilience scan
+  const NIFTY_DOWN_THRESHOLD = period === "5d" ? -1.0 : -0.4;
+  const marketIsDown = niftyChg <= NIFTY_DOWN_THRESHOLD;
+
+  // Fetch sector alignment cache once
+  const sectorAlignMap = await getSectorAlignMap().catch(() => new Map());
+
+  const results = [];
+
+  for (let i = 0; i < stocks.length; i += BATCH) {
+    const batch    = stocks.slice(i, i + BATCH);
+    const batchRes = await Promise.allSettled(
+      batch.map(async symbol => {
+        try {
+          // 2 months is enough: EMA21 (21d) + RSI14 + vol avg 20d
+          const data = await fetchNSEData(symbol, 2);
+          if (!data || data.length < 25) return null;
+
+          const len   = data.length;
+          const close = data[len - 1].close;
+          const prev1 = data[len - 2].close;
+          const prev5 = data[Math.max(0, len - 6)].close;
+
+          const chg1d = +((close - prev1) / prev1 * 100).toFixed(2);
+          const chg5d = +((close - prev5) / prev5 * 100).toFixed(2);
+          const chg   = period === "5d" ? chg5d : chg1d;
+          const rs    = +(chg - niftyChg).toFixed(2);
+
+          // Filter: stock must outperform Nifty by at least +0.3%
+          if (rs < 0.3) return null;
+
+          // Technical context
+          const closes  = data.map(d => d.close);
+          const highs   = data.map(d => d.high);
+          const lows    = data.map(d => d.low);
+          const volumes = data.map(d => d.volume);
+
+          const ema21arr = EMA.calculate({ period: 21, values: closes });
+          const ema50arr = EMA.calculate({ period: 50, values: closes });
+          const rsiArr   = RSI.calculate({ period: 14, values: closes });
+          const atrArr   = ATR.calculate({ high: highs, low: lows, close: closes, period: 14 });
+
+          const ema21      = ema21arr[ema21arr.length - 1];
+          const ema50      = ema50arr.length ? ema50arr[ema50arr.length - 1] : null;
+          const rsi        = rsiArr.length   ? +rsiArr[rsiArr.length - 1].toFixed(1) : null;
+          const atr        = atrArr.length   ? atrArr[atrArr.length - 1] : null;
+          const aboveEMA21 = close > ema21;
+          const aboveEMA50 = ema50 ? close > ema50 : null;
+
+          const avgVol = volumes.slice(-21, -1).reduce((a, b) => a + b, 0) / 20;
+          const volRatio = avgVol > 0 ? +(volumes[len - 1] / avgVol).toFixed(2) : null;
+
+          // Trend strength: are EMAs pointing up?
+          const ema21Slope = ema21arr.length >= 4
+            ? ema21arr[ema21arr.length - 1] > ema21arr[ema21arr.length - 4]
+            : null;
+
+          // Sector alignment
+          const sector   = STOCK_SECTORS[symbol] || "Diversified";
+          const idxSym   = SECTOR_INDEX[sector]  || "^NSEI";
+          const sa       = sectorAlignMap.get(idxSym);
+          const sectorOk = sa?.isAbove ?? null;
+
+          // Resilience grade: score 0-5
+          const grade = [
+            rs >= 1.0,          // strong outperformance
+            aboveEMA21,         // price above trend
+            aboveEMA50,         // in strong uptrend
+            ema21Slope,         // trend accelerating
+            sectorOk,           // sector also holding
+          ].filter(v => v === true).length;
+
+          const target1  = atr ? +(close + atr * 2).toFixed(2) : null;
+          const stopLoss = atr ? +(close - atr * 1.5).toFixed(2) : null;
+
+          return {
+            symbol, price: +close.toFixed(2),
+            chg1d, chg5d, chg, rs,
+            rsi, aboveEMA21, aboveEMA50, ema21Slope,
+            volRatio, sector, sectorOk,
+            grade, target1, stopLoss,
+            ema21: ema21 ? +ema21.toFixed(2) : null,
+            ema50: ema50 ? +ema50.toFixed(2) : null,
+          };
+        } catch { return null; }
+      })
+    );
+    batchRes.forEach(r => { if (r.status === "fulfilled" && r.value) results.push(r.value); });
+    if (i + BATCH < stocks.length) await new Promise(r => setTimeout(r, 400));
+  }
+
+  // Sort: best relative strength first, then grade
+  results.sort((a, b) => (b.grade - a.grade) || (b.rs - a.rs));
+
+  res.json({
+    universe, label: u.label, period,
+    niftyChg1d, niftyChg5d, niftyChg, niftyClose,
+    marketIsDown, niftyDownThreshold: NIFTY_DOWN_THRESHOLD,
+    total: stocks.length, count: results.length, results,
+  });
+});
+
 // ─── Nifty Options Signal Engine ─────────────────────────────────────────────
 
 function getNextThursday() {

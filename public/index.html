@@ -740,7 +740,7 @@
       .logo { font-size: 1rem; text-align: center; }
       .tabs {
         display: grid;
-        grid-template-columns: repeat(3, 1fr);
+        grid-template-columns: repeat(4, 1fr);
         gap: 4px;
       }
       .tab {
@@ -777,7 +777,7 @@
       .card { padding: 14px 12px; }
 
       .indicators-grid {
-        grid-template-columns: repeat(3, 1fr);
+        grid-template-columns: repeat(4, 1fr);
         gap: 6px;
       }
       .ind-box { padding: 8px 6px; }
@@ -922,6 +922,7 @@
     <div class="tabs">
       <button class="tab active" onclick="showTab('search')">Stock Analysis</button>
       <button class="tab" onclick="showTab('scan')">Swing Scanner</button>
+      <button class="tab" onclick="showTab('resilience')">🛡️ Resilience</button>
       <button class="tab" onclick="showTab('nifty')">⚡ Nifty Trading</button>
     </div>
   </header>
@@ -974,6 +975,37 @@
 
     <div class="progress-bar" id="progressBar"><div class="progress-fill" id="progressFill"></div></div>
     <div id="scanResults"><div class="loading-overlay"><p>Select a universe above and click <strong style="color:#e2e8f0">Run Scan</strong>.</p></div></div>
+  </div>
+
+  <!-- RESILIENCE TAB -->
+  <div id="resilienceTab" style="display:none;padding:24px;max-width:1100px;margin:0 auto">
+    <div class="scan-header">
+      <div>
+        <h2 style="margin:0">🛡️ Resilience Scanner</h2>
+        <p style="margin:4px 0 0;color:#64748b;font-size:13px">Stocks holding flat or rising while Nifty falls — sign of institutional accumulation</p>
+      </div>
+      <button class="btn-primary" id="resBtn" onclick="runResilienceScan()">Scan Now</button>
+    </div>
+
+    <!-- Controls -->
+    <div style="display:flex;gap:10px;margin:14px 0;flex-wrap:wrap;align-items:center">
+      <div style="display:flex;gap:6px;background:#1e293b;border-radius:8px;padding:4px">
+        <button id="resPer1d" class="universe-btn active" style="padding:5px 14px;border-radius:6px;font-size:12px" onclick="setResPeriod('1d')">Today (1d)</button>
+        <button id="resPer5d" class="universe-btn"        style="padding:5px 14px;border-radius:6px;font-size:12px" onclick="setResPeriod('5d')">5-Day</button>
+      </div>
+      <select id="resUniverse" style="background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:8px;padding:6px 10px;font-size:12px">
+        <option value="nifty50">Nifty 50</option>
+        <option value="nifty100">Nifty 100</option>
+        <option value="nifty200" selected>Nifty 200</option>
+        <option value="multibagger">Multibagger</option>
+        <option value="crossover">All (250+)</option>
+      </select>
+    </div>
+
+    <div class="progress-bar" id="resProgressBar" style="display:none"><div class="progress-fill" id="resProgressFill"></div></div>
+    <div id="resResults">
+      <div class="loading-overlay"><p>Click <strong style="color:#e2e8f0">Scan Now</strong> to find resilient stocks.</p></div>
+    </div>
   </div>
 
   <!-- NIFTY TRADING TAB -->
@@ -1139,14 +1171,16 @@
     });
 
     function showTab(name) {
-      document.getElementById("searchTab").style.display = name === "search" ? "block" : "none";
-      document.getElementById("scanTab").style.display   = name === "scan"   ? "block" : "none";
-      document.getElementById("niftyTab").style.display  = name === "nifty"  ? "block" : "none";
+      document.getElementById("searchTab").style.display     = name === "search"     ? "block" : "none";
+      document.getElementById("scanTab").style.display       = name === "scan"       ? "block" : "none";
+      document.getElementById("resilienceTab").style.display = name === "resilience" ? "block" : "none";
+      document.getElementById("niftyTab").style.display      = name === "nifty"      ? "block" : "none";
       document.querySelectorAll(".tab").forEach((t, i) => {
         t.classList.toggle("active",
           (i === 0 && name === "search") ||
           (i === 1 && name === "scan") ||
-          (i === 2 && name === "nifty")
+          (i === 2 && name === "resilience") ||
+          (i === 3 && name === "nifty")
         );
       });
       if (name === "nifty") initNiftyTab();
@@ -3185,6 +3219,178 @@
       // Flash the form
       form.style.outline = "2px solid " + (type === "CE" ? "#4ade80" : "#f87171");
       setTimeout(() => { form.style.outline = ""; }, 1200);
+    }
+
+
+    // ─── Resilience Scanner ────────────────────────────────────────────────────
+    let _resPeriod = "1d";
+
+    function setResPeriod(p) {
+      _resPeriod = p;
+      document.getElementById("resPer1d").classList.toggle("active", p === "1d");
+      document.getElementById("resPer5d").classList.toggle("active", p === "5d");
+    }
+
+    async function runResilienceScan() {
+      const universe = document.getElementById("resUniverse").value;
+      const btn      = document.getElementById("resBtn");
+      const panel    = document.getElementById("resResults");
+      const progBar  = document.getElementById("resProgressBar");
+      const progFill = document.getElementById("resProgressFill");
+
+      btn.disabled  = true;
+      btn.textContent = "Scanning…";
+      progBar.style.display = "block";
+      progFill.style.width  = "0%";
+      panel.innerHTML = `<div class="loading-overlay"><div class="spinner"></div><p>Scanning for resilient stocks…</p></div>`;
+
+      let prog = 0;
+      const ticker = setInterval(() => {
+        prog = Math.min(prog + 3, 88);
+        progFill.style.width = prog + "%";
+      }, 800);
+
+      try {
+        const r   = await fetch(`/api/scan-resilience?universe=${universe}&period=${_resPeriod}`);
+        const data = await r.json();
+        clearInterval(ticker);
+        progFill.style.width = "100%";
+        setTimeout(() => { progBar.style.display = "none"; }, 400);
+        renderResilienceResults(data, panel);
+      } catch(e) {
+        clearInterval(ticker);
+        panel.innerHTML = `<div class="error-box">Scan failed: ${e.message}</div>`;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "Scan Now";
+      }
+    }
+
+    function renderResilienceResults(data, panel) {
+      if (data.error) {
+        panel.innerHTML = `<div class="error-box">${data.error}</div>`;
+        return;
+      }
+
+      const { niftyChg, niftyChg1d, niftyChg5d, niftyClose, marketIsDown,
+              period, count, total, results, label } = data;
+
+      const niftyColor = niftyChg < 0 ? "#f87171" : "#4ade80";
+      const periodLabel = period === "5d" ? "5-day" : "today";
+
+      // Market condition banner
+      let banner = "";
+      if (!marketIsDown) {
+        banner = `<div style="background:#1e3a5f;border:1px solid #3b82f6;border-radius:10px;padding:14px 18px;margin-bottom:16px;color:#93c5fd">
+          <strong style="color:#60a5fa">Market is not significantly down ${periodLabel}</strong> —
+          Nifty <span style="color:${niftyColor}">${niftyChg > 0 ? "+" : ""}${niftyChg}%</span>.
+          Resilience scan is most useful when market is down ≥ ${period === "5d" ? "1%" : "0.4%"}.
+          Showing stocks with positive RS vs Nifty regardless.
+        </div>`;
+      } else {
+        banner = `<div style="background:#1c2a1c;border:1px solid #4ade80;border-radius:10px;padding:14px 18px;margin-bottom:16px">
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+            <span style="font-size:20px">🛡️</span>
+            <div>
+              <div style="font-weight:600;color:#e2e8f0;font-size:14px">
+                Nifty is down <span style="color:#f87171">${niftyChg}%</span> ${periodLabel} — ${count} stock${count !== 1 ? "s" : ""} showing resilience
+              </div>
+              <div style="color:#64748b;font-size:12px;margin-top:2px">
+                Nifty 1d: <span style="color:${niftyChg1d < 0 ? "#f87171" : "#4ade80"}">${niftyChg1d > 0 ? "+" : ""}${niftyChg1d}%</span> &nbsp;·&nbsp;
+                Nifty 5d: <span style="color:${niftyChg5d < 0 ? "#f87171" : "#4ade80"}">${niftyChg5d > 0 ? "+" : ""}${niftyChg5d}%</span> &nbsp;·&nbsp;
+                Scanned ${total} stocks from ${label}
+              </div>
+            </div>
+          </div>
+        </div>`;
+      }
+
+      if (results.length === 0) {
+        panel.innerHTML = banner + `<div style="text-align:center;padding:40px;color:#475569">No resilient stocks found — everything is falling with the market.</div>`;
+        return;
+      }
+
+      // Grade color
+      const gradeColor = g => g >= 4 ? "#4ade80" : g >= 3 ? "#60a5fa" : g >= 2 ? "#fbbf24" : "#94a3b8";
+      const gradeLabel = g => g >= 4 ? "Strong" : g >= 3 ? "Good" : g >= 2 ? "Moderate" : "Weak";
+      const chgColor   = v => v > 0 ? "#4ade80" : v < -0.1 ? "#f87171" : "#94a3b8";
+      const rsColor    = v => v >= 1.5 ? "#4ade80" : v >= 0.5 ? "#60a5fa" : "#94a3b8";
+
+      const rows = results.map(s => {
+        const gc = gradeColor(s.grade);
+        // Grade bar (filled dots)
+        const dots = Array.from({length:5}, (_, i) =>
+          `<span style="color:${i < s.grade ? gc : "#1e293b"};font-size:10px">●</span>`
+        ).join("");
+
+        const trendIcon = s.aboveEMA21
+          ? `<span style="color:#4ade80" title="Above EMA21">▲</span>`
+          : `<span style="color:#f87171" title="Below EMA21">▼</span>`;
+
+        const volBadge = s.volRatio == null ? "" :
+          s.volRatio >= 1.5 ? `<span style="color:#4ade80;font-size:10px">Vol ${s.volRatio}x ✓</span>` :
+          s.volRatio >= 1.0 ? `<span style="color:#94a3b8;font-size:10px">Vol ${s.volRatio}x</span>` :
+          `<span style="color:#64748b;font-size:10px">Vol ${s.volRatio}x</span>`;
+
+        const rsiStr = s.rsi != null
+          ? `<span style="color:${s.rsi < 40 ? "#94a3b8" : s.rsi > 70 ? "#f87171" : "#4ade80"}">${s.rsi}</span>`
+          : "—";
+
+        const slTgt = s.target1 && s.stopLoss
+          ? `<div style="font-size:10px;color:#64748b;margin-top:2px">SL ₹${s.stopLoss} · T1 ₹${s.target1}</div>`
+          : "";
+
+        return `<tr style="border-bottom:1px solid #1e293b">
+          <td style="padding:10px 8px;font-weight:600;white-space:nowrap">
+            <a href="#" onclick="document.getElementById('symbolInput').value='${s.symbol}';showTab('search');analyzeStock();return false"
+               style="color:#e2e8f0;text-decoration:none">${s.symbol}</a>
+            <div style="font-size:10px;color:#475569">${s.sector}</div>
+          </td>
+          <td style="padding:10px 8px;text-align:right">
+            ₹${s.price.toLocaleString("en-IN")}
+            ${slTgt}
+          </td>
+          <td style="padding:10px 8px;text-align:right;color:${chgColor(s.chg1d)}">${s.chg1d > 0 ? "+" : ""}${s.chg1d}%</td>
+          <td style="padding:10px 8px;text-align:right;color:${chgColor(s.chg5d)}">${s.chg5d > 0 ? "+" : ""}${s.chg5d}%</td>
+          <td style="padding:10px 8px;text-align:right;color:${rsColor(s.rs)};font-weight:600">+${s.rs}%</td>
+          <td style="padding:10px 8px;text-align:center">${trendIcon} ${rsiStr}</td>
+          <td style="padding:10px 8px">${volBadge}</td>
+          <td style="padding:10px 8px;text-align:center">
+            <div style="display:flex;align-items:center;gap:4px">
+              <span style="font-size:11px;color:${gc};font-weight:600">${gradeLabel(s.grade)}</span>
+              <div style="margin-left:4px">${dots}</div>
+            </div>
+          </td>
+        </tr>`;
+      }).join("");
+
+      panel.innerHTML = banner + `
+        <div style="font-size:11px;color:#475569;margin-bottom:8px">
+          RS = Stock % change − Nifty % change. Sorted by grade then RS strength.
+        </div>
+        <div style="overflow-x:auto">
+          <table style="width:100%;border-collapse:collapse;font-size:13px">
+            <thead>
+              <tr style="border-bottom:1px solid #334155;color:#64748b;font-size:11px;text-transform:uppercase">
+                <th style="padding:8px;text-align:left">Stock</th>
+                <th style="padding:8px;text-align:right">Price</th>
+                <th style="padding:8px;text-align:right">1d%</th>
+                <th style="padding:8px;text-align:right">5d%</th>
+                <th style="padding:8px;text-align:right">RS vs Nifty</th>
+                <th style="padding:8px;text-align:center">Trend / RSI</th>
+                <th style="padding:8px">Volume</th>
+                <th style="padding:8px;text-align:center">Grade</th>
+              </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+          </table>
+        </div>
+        <div style="margin-top:14px;padding:10px 14px;background:#0f172a;border-radius:8px;font-size:11px;color:#475569">
+          <strong style="color:#64748b">How to use:</strong>
+          Grade = 5 factors: RS ≥1%, above EMA21, above EMA50, EMA21 slope rising, sector holding.
+          "Strong" stocks (grade 4-5) are best candidates — institutions are quietly accumulating.
+          Best entry: wait for Nifty bounce, these stocks should lead.
+        </div>`;
     }
 
   </script>
