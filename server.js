@@ -1258,7 +1258,7 @@ function detectFreshEMACross(data, lookback = 5) {
   };
 
   const satisfied = [];
-  if (checks.emaCross)      satisfied.push(`EMA9×EMA21 (${crossDay === 1 ? "today" : crossDay === 2 ? "yesterday" : crossDay + "d ago"})`);
+  if (checks.emaCross)      satisfied.push(`EMA9×EMA21 (${crossDay === 1 ? "yesterday" : crossDay === 2 ? "2d ago" : crossDayVisual + "d ago"})`);
   if (checks.rsiInRange)    satisfied.push(`RSI ${rsi.toFixed(0)} in 45-65`);
   else if (checks.rsiAbove50) satisfied.push(`RSI ${rsi.toFixed(0)} > 50`);
   if (checks.aboveEMA50)    satisfied.push("Above EMA50");
@@ -1281,12 +1281,15 @@ function detectFreshEMACross(data, lookback = 5) {
 
   const condCount  = satisfied.length;
   const confidence = condCount >= 6 ? "HIGH" : condCount >= 4 ? "MEDIUM" : "LOW";
-  const crossDate  = hasCross ? (data[len - crossDay]?.date || "") : "";
+  // Visual cross appears one bar BEFORE algorithmic confirmation (EMA is close-based).
+  // crossDay=1 = algo confirmed today's close, but the cross was visible YESTERDAY on charts.
+  const crossDate  = hasCross ? (data[len - crossDay - 1]?.date || "") : "";
+  const crossDayVisual = crossDay + 1; // days ago the cross appeared on the chart
 
   return {
     crossDay,
     crossDate,
-    crossDayLabel: crossDay === 1 ? "Today" : crossDay === 2 ? "Yesterday" : crossDay > 2 ? `${crossDay}d ago` : "—",
+    crossDayLabel: crossDay === 1 ? "Yesterday" : crossDay === 2 ? "2d ago" : crossDay > 2 ? `${crossDayVisual}d ago` : "—",
     hasCross,
     rsi:        +rsi.toFixed(1),
     rsiOk,
@@ -1447,7 +1450,7 @@ app.get("/api/stock/:symbol", async (req, res) => {
       crossDayLabel: cross.crossDayLabel,
       crossDate:     cross.crossDate,
       conditions: [
-        { label: "EMA9×21 Cross today",          value: cross.crossDayLabel,                  ok: cross.crossDay === 1,     detail: cross.crossDay === 1 ? `Today (${cross.crossDate})` : cross.hasCross ? `${cross.crossDayLabel} — not today` : "No recent cross" },
+        { label: "EMA9×21 Fresh Cross (≤2d)",     value: cross.crossDayLabel,                  ok: cross.crossDay <= 2,      detail: cross.hasCross ? `${cross.crossDayLabel} — ${cross.crossDate}` : "No recent cross" },
         { label: "Volume ≥ 1.3× avg",          value: `${cross.volRatio}x`,                 ok: cross.checks.volSpike,    detail: `Vol ratio: ${cross.volRatio}x` },
         { label: "RSI 45–65 (room to run)",     value: cross.rsi != null ? `${cross.rsi}` : "—", ok: cross.checks.rsiInRange, detail: `RSI: ${cross.rsi}` },
         { label: "EMA9 & EMA21 slope ↑",        value: cross.checks.emaSlope ? "Rising" : "Flat/Down", ok: cross.checks.emaSlope, detail: cross.checks.emaSlope ? "Both EMAs rising (3d)" : "EMAs not both rising" },
@@ -1456,9 +1459,9 @@ app.get("/api/stock/:symbol", async (req, res) => {
       ],
       filterScore:  cross.filterScore,
       filterDenom:  5,
-      // Core signal: cross must be TODAY (crossDay===1) + volume + RSI
-      coreSignal: cross.crossDay === 1 && cross.checks.volSpike && cross.checks.rsiInRange,
-      verdict: cross.crossDay === 1 && cross.checks.volSpike && cross.checks.rsiInRange
+      // Core signal: fresh cross (visual ≤2d ago) + volume + RSI
+      coreSignal: cross.crossDay <= 2 && cross.checks.volSpike && cross.checks.rsiInRange,
+      verdict: cross.crossDay <= 2 && cross.checks.volSpike && cross.checks.rsiInRange
              ? (cross.filterScore >= 4 ? "STRONG BUY" : "BUY")
              : "NO SIGNAL",
       stopLoss: cross.stopLoss,
