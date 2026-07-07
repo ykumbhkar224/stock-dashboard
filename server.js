@@ -745,6 +745,181 @@ async function fetchIndexDaily(yahooSymbol, months = 5) {
 
 const fetchNiftyDaily = (months) => fetchIndexDaily("^NSEI", months);
 
+// Fetch Nifty 15-min intraday bars for today's session
+let _nifty15mCache = { data: null, expiry: 0 };
+async function fetchNifty15m() {
+  if (_nifty15mCache.data && Date.now() < _nifty15mCache.expiry) return _nifty15mCache.data;
+  try {
+    const url = "https://query1.finance.yahoo.com/v8/finance/chart/%5ENSEI?interval=15m&range=1d";
+    const res = await fetch(url, {
+      headers: { "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36" }
+    });
+    if (!res.ok) return [];
+    const json   = await res.json();
+    const result = json?.chart?.result?.[0];
+    if (!result?.timestamp?.length) return [];
+    const ohlcv = result.indicators?.quote?.[0];
+    const bars  = result.timestamp.map((ts, i) => {
+      const d = new Date(ts * 1000);
+      const hh = String(d.getUTCHours() + 5).padStart(2, "0");        // IST offset +5:30
+      const mm = String((d.getUTCMinutes() + 30) % 60).padStart(2, "0");
+      const hAdj = d.getUTCMinutes() + 30 >= 60
+        ? String(d.getUTCHours() + 6).padStart(2, "0")
+        : hh;
+      return {
+        time:      `${hAdj}:${mm}`,
+        timestamp: ts * 1000,
+        open:   ohlcv.open[i],
+        high:   ohlcv.high[i],
+        low:    ohlcv.low[i],
+        close:  ohlcv.close[i],
+        volume: ohlcv.volume[i] || 0
+      };
+    }).filter(d => d.open != null && d.close != null && d.close > 0);
+    _nifty15mCache = { data: bars, expiry: Date.now() + 3 * 60 * 1000 }; // 3-min cache
+    return bars;
+  } catch { return []; }
+}
+
+// ─── 15-min Options Strategy Engine ─────────────────────────────────────────
+
+function computeStrategy15m(bars) {
+  if (!bars || bars.length < 6) return null;
+
+  const closes  = bars.map(b => b.close);
+  const highs   = bars.map(b => b.high);
+  const lows    = bars.map(b => b.low);
+  const len     = bars.length;
+
+  // Session VWAP (reset each day)
+  let sumPV = 0, sumV = 0;
+  const vwapArr = bars.map(b => {
+    const tp = (b.high + b.low + b.close) / 3;
+    sumPV += tp * b.volume;
+    sumV  += b.volume;
+    return sumV > 0 ? sumPV / sumV : tp;
+  });
+  const vwap = vwapArr[len - 1];
+
+  // Indicators on 15-min bars
+  const ema9arr  = EMA.calculate({ period: 9,  values: closes });
+  const ema21arr = EMA.calculate({ period: 21, values: closes });
+  const rsiArr   = RSI.calculate({ period: 14, values: closes });
+  const atrArr   = ATR.calculate({ high: highs, low: lows, close: closes, period: 14 });
+
+  if (ema9arr.length < 2 || ema21arr.length < 2) return null;
+
+  const ema9  = ema9arr[ema9arr.length - 1];
+  const ema21 = ema21arr[ema21arr.length - 1];
+  const rsi   = rsiArr.length  > 0 ? rsiArr[rsiArr.length - 1]   : 50;
+  const atr   = atrArr.length  > 0 ? atrArr[atrArr.length - 1]   : null;
+  const spot  = closes[len - 1];
+
+  // EMA9×21 cross in last 3 bars
+  let crossDir = null, crossBarsAgo = null;
+  const lookback = Math.min(3, ema9arr.length - 1);
+  for (let i = 1; i <= lookback; i++) {
+    const e9C  = ema9arr[ema9arr.length - i];
+    const e21C = ema21arr[ema21arr.length - i];
+    const e9P  = ema9arr[ema9arr.length - i - 1];
+    const e21P = ema21arr[ema21arr.length - i - 1];
+    if (e9C != null && e21C != null && e9P != null && e21P != null) {
+      if (e9C > e21C && e9P <= e21P) { crossDir = "up";   crossBarsAgo = i - 1; break; }
+      if (e9C < e21C && e9P >= e21P) { crossDir = "down"; crossBarsAgo = i - 1; break; }
+    }
+  }
+
+  // Time filter (IST)
+  const lastTime = bars[len - 1].time; // "HH:MM"
+  const [hh, mm] = lastTime.split(":").map(Number);
+  const tod = hh * 60 + mm; // minutes since midnight IST
+  const inOpenNoise  = tod <= 9 * 60 + 30;   // 9:15–9:30 — skip first candle
+  const afterCutoff  = tod >= 14 * 60 + 30;  // after 2:30 PM — no new entries
+  const nearExpiry   = tod >= 15 * 60;        // after 3:00 PM — manage only
+
+  const aboveVwap  = spot > vwap;
+  const rsiLong    = rsi >= 55 && rsi <= 75;
+  const rsiShort   = rsi <= 45 && rsi >= 25;
+  const rsiOB      = rsi > 75;
+  const rsiOS      = rsi < 25;
+
+  const atm    = Math.round(spot / 50) * 50;
+  let signal   = "WAIT", entry = null, sl = null, t1 = null, t2 = null;
+  let optStrike = atm, optType = null;
+  const reasons = [], cautions = [];
+
+  if (nearExpiry) {
+    cautions.push("After 3 PM — exit open positions, no new trades");
+  } else if (afterCutoff) {
+    cautions.push("After 2:30 PM — no new entries, manage existing trades");
+  } else if (inOpenNoise) {
+    cautions.push("Opening 15 min (9:15–9:30) — high volatility, wait for first candle close");
+  } else if (crossDir === "up" && aboveVwap && rsiLong) {
+    signal    = "BUY CE";
+    entry     = +spot.toFixed(0);
+    sl        = atr ? +(spot - atr * 1.5).toFixed(0) : null;
+    t1        = atr ? +(spot + atr * 2.0).toFixed(0) : null;
+    t2        = atr ? +(spot + atr * 3.0).toFixed(0) : null;
+    optType   = "CE";
+    optStrike = atm;
+    reasons.push(`EMA9 (${ema9.toFixed(0)}) crossed above EMA21 (${ema21.toFixed(0)}) — ${crossBarsAgo === 0 ? "this bar" : crossBarsAgo + " bar(s) ago"}`);
+    reasons.push(`Price ${spot.toFixed(0)} above VWAP ${vwap.toFixed(0)} — bullish intraday bias`);
+    reasons.push(`RSI ${rsi.toFixed(1)} in 55–75 — momentum zone, room to run`);
+  } else if (crossDir === "down" && !aboveVwap && rsiShort) {
+    signal    = "BUY PE";
+    entry     = +spot.toFixed(0);
+    sl        = atr ? +(spot + atr * 1.5).toFixed(0) : null;
+    t1        = atr ? +(spot - atr * 2.0).toFixed(0) : null;
+    t2        = atr ? +(spot - atr * 3.0).toFixed(0) : null;
+    optType   = "PE";
+    optStrike = atm;
+    reasons.push(`EMA9 (${ema9.toFixed(0)}) crossed below EMA21 (${ema21.toFixed(0)}) — ${crossBarsAgo === 0 ? "this bar" : crossBarsAgo + " bar(s) ago"}`);
+    reasons.push(`Price ${spot.toFixed(0)} below VWAP ${vwap.toFixed(0)} — bearish intraday bias`);
+    reasons.push(`RSI ${rsi.toFixed(1)} in 25–45 — downward momentum`);
+  } else {
+    // Show partial info and what's missing
+    if (crossDir === "up") {
+      reasons.push(`EMA9 crossed above EMA21 — bullish cross present`);
+      if (!aboveVwap)  cautions.push(`Price (${spot.toFixed(0)}) still below VWAP (${vwap.toFixed(0)}) — wait for VWAP break`);
+      if (!rsiLong)    cautions.push(rsiOB ? `RSI ${rsi.toFixed(1)} overbought — momentum exhausting` : `RSI ${rsi.toFixed(1)} — need RSI > 55 for CE entry`);
+    } else if (crossDir === "down") {
+      reasons.push(`EMA9 crossed below EMA21 — bearish cross present`);
+      if (aboveVwap)   cautions.push(`Price (${spot.toFixed(0)}) still above VWAP (${vwap.toFixed(0)}) — wait for VWAP breakdown`);
+      if (!rsiShort)   cautions.push(rsiOS ? `RSI ${rsi.toFixed(1)} oversold — bounce risk` : `RSI ${rsi.toFixed(1)} — need RSI < 45 for PE entry`);
+    } else {
+      if (ema9 > ema21 && aboveVwap)       reasons.push(`Bullish bias: EMA9 > EMA21, price > VWAP — watch for CE signal`);
+      else if (ema9 < ema21 && !aboveVwap) reasons.push(`Bearish bias: EMA9 < EMA21, price < VWAP — watch for PE signal`);
+      else                                  reasons.push(`Mixed: EMA and VWAP not aligned — sideways, avoid directional options`);
+      cautions.push("No EMA9×21 cross in last 3 bars — wait for crossover signal");
+    }
+  }
+
+  // Build last-10-bar snapshot for the frontend table
+  const recent = bars.slice(-10).map(b => ({
+    time:  b.time,
+    open:  +b.open.toFixed(2),
+    high:  +b.high.toFixed(2),
+    low:   +b.low.toFixed(2),
+    close: +b.close.toFixed(2)
+  }));
+
+  return {
+    signal, entry, sl, t1, t2,
+    spot:   +spot.toFixed(2),
+    vwap:   +vwap.toFixed(2),
+    ema9:   +ema9.toFixed(2),
+    ema21:  +ema21.toFixed(2),
+    rsi:    +rsi.toFixed(1),
+    atr:    atr ? +atr.toFixed(2) : null,
+    atm, optStrike, optType,
+    aboveVwap, crossDir, crossBarsAgo,
+    inOpenNoise, afterCutoff, nearExpiry,
+    barCount: len, lastBarTime: lastTime,
+    reasons, cautions,
+    recent
+  };
+}
+
 // ─── Volume Analysis ─────────────────────────────────────────────────────────
 
 function analyzeVolume(data) {
@@ -1968,7 +2143,21 @@ function computeNiftySignal(dailyData, intradayData, globalSentiment) {
 
 // Nifty 15-min intraday — returns empty array (intraday needs Yahoo Finance which is rate-limited)
 app.get("/api/nifty/intraday", async (req, res) => {
-  res.json([]);
+  const bars = await fetchNifty15m();
+  res.json(bars);
+});
+
+// 15-min EMA+VWAP+RSI options strategy
+app.get("/api/nifty/strategy15", async (req, res) => {
+  try {
+    const bars = await fetchNifty15m();
+    if (!bars || bars.length < 4)
+      return res.json({ error: "Insufficient 15-min data — market may be closed or holiday", bars: [] });
+    const strategy = computeStrategy15m(bars);
+    res.json({ strategy, barCount: bars.length, timestamp: new Date().toISOString() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Full Nifty signal — daily from Stooq, globals from Stooq + NSE, intraday disabled

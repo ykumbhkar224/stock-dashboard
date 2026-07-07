@@ -1061,9 +1061,25 @@
       </div>
     </div>
 
+    <!-- 15-min Live Options Strategy -->
+    <div class="nifty-section card" id="strat15Card">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;flex-wrap:wrap;gap:8px">
+        <div class="nifty-section-title" style="margin:0">⚡ 15-Min Options Strategy
+          <span style="font-size:10px;font-weight:400;color:#334155;text-transform:none;margin-left:8px">EMA9×21 + VWAP + RSI · updates every 5 min</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <span id="strat15LastUpdate" style="font-size:10px;color:#475569"></span>
+          <button class="ctbtn" onclick="loadStrategy15(true)">↻ Refresh</button>
+        </div>
+      </div>
+      <div id="strat15Box">
+        <div class="loading-overlay"><div class="spinner"></div><p>Loading 15-min strategy…</p></div>
+      </div>
+    </div>
+
     <!-- Option Signal -->
     <div class="nifty-section card">
-      <div class="nifty-section-title">🎯 Option Signal</div>
+      <div class="nifty-section-title">🎯 Daily Option Signal</div>
       <div id="niftySignalBox">
         <div class="loading-overlay"><div class="spinner"></div><p>Analyzing Nifty…</p></div>
       </div>
@@ -2692,6 +2708,127 @@
       renderNiftyKeyLevels(data.signal);
       loadOptionChain(false);
       loadNiftyBacktest();
+      loadStrategy15(false);
+    }
+
+    // ── 15-min strategy ───────────────────────────────────────────────────────
+    let _strat15Timer = null;
+    async function loadStrategy15(force) {
+      const box = document.getElementById("strat15Box");
+      if (!box) return;
+      if (!force) box.innerHTML = `<div class="loading-overlay"><div class="spinner"></div><p>Loading 15-min signal…</p></div>`;
+      try {
+        const res  = await fetch("/api/nifty/strategy15");
+        const json = await res.json();
+        if (json.error) { box.innerHTML = `<div style="color:#94a3b8;padding:16px;font-size:13px">⚠️ ${json.error}</div>`; return; }
+        renderStrategy15(json.strategy);
+        const ts = document.getElementById("strat15LastUpdate");
+        if (ts) ts.textContent = "Updated " + new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" });
+      } catch(e) {
+        box.innerHTML = `<div class="error-box">15m fetch failed: ${e.message}</div>`;
+      }
+      // Auto-refresh every 5 min
+      clearTimeout(_strat15Timer);
+      _strat15Timer = setTimeout(() => loadStrategy15(false), 5 * 60 * 1000);
+    }
+
+    function renderStrategy15(s) {
+      const box = document.getElementById("strat15Box");
+      if (!s) { box.innerHTML = `<div style="color:#94a3b8;padding:16px;font-size:13px">No signal data available.</div>`; return; }
+
+      const isLong  = s.signal === "BUY CE";
+      const isShort = s.signal === "BUY PE";
+      const isWait  = !isLong && !isShort;
+
+      const sigColor  = isLong ? "#4ade80" : isShort ? "#f87171" : "#94a3b8";
+      const sigBg     = isLong ? "rgba(74,222,128,.08)" : isShort ? "rgba(248,113,113,.08)" : "rgba(148,163,184,.06)";
+      const sigBorder = isLong ? "rgba(74,222,128,.3)"  : isShort ? "rgba(248,113,113,.3)"  : "rgba(148,163,184,.2)";
+      const sigIcon   = isLong ? "▲" : isShort ? "▼" : "—";
+
+      // Condition checklist
+      const cond = [
+        { label: "EMA9×21 Cross", met: !!s.crossDir, detail: s.crossDir ? (s.crossDir === "up" ? `↑ Bullish (${s.crossBarsAgo === 0 ? "this bar" : s.crossBarsAgo + "b ago"})` : `↓ Bearish (${s.crossBarsAgo === 0 ? "this bar" : s.crossBarsAgo + "b ago"})`) : "No cross" },
+        { label: "Price vs VWAP", met: isLong ? s.aboveVwap : isShort ? !s.aboveVwap : s.aboveVwap !== undefined, detail: `${s.spot} ${s.aboveVwap ? ">" : "<"} VWAP ${s.vwap}` },
+        { label: "RSI Zone",      met: isLong ? s.rsi >= 55 && s.rsi <= 75 : isShort ? s.rsi <= 45 && s.rsi >= 25 : true, detail: `RSI ${s.rsi} — ${s.rsi > 75 ? "Overbought" : s.rsi < 25 ? "Oversold" : s.rsi >= 55 ? "Bullish zone" : s.rsi <= 45 ? "Bearish zone" : "Neutral"}` },
+        { label: "Time Filter",   met: !s.afterCutoff && !s.inOpenNoise && !s.nearExpiry, detail: s.nearExpiry ? "After 3 PM — exit only" : s.afterCutoff ? "After 2:30 PM — no new entries" : s.inOpenNoise ? "Wait for 9:30 AM" : `${s.lastBarTime} — trading window ✓` }
+      ];
+
+      const condHtml = cond.map(c => `
+        <div style="display:flex;align-items:flex-start;gap:8px;padding:6px 0;border-bottom:1px solid #1e293b">
+          <span style="color:${c.met ? "#4ade80" : "#f87171"};font-size:13px;margin-top:1px;flex-shrink:0">${c.met ? "✓" : "✗"}</span>
+          <div>
+            <div style="font-size:12px;font-weight:600;color:#cbd5e1">${c.label}</div>
+            <div style="font-size:11px;color:#64748b">${c.detail}</div>
+          </div>
+        </div>`).join("");
+
+      // Trade setup table
+      const setupHtml = (!isWait && s.entry) ? `
+        <div style="margin-top:14px">
+          <div style="font-size:11px;font-weight:700;color:#64748b;letter-spacing:.06em;margin-bottom:6px">TRADE SETUP</div>
+          <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px">
+            ${[
+              ["Entry (Spot)", s.entry, "#94a3b8"],
+              ["Stop Loss",    s.sl,    "#f87171"],
+              ["Target 1",     s.t1,    "#4ade80"],
+              ["Target 2",     s.t2,    "#34d399"]
+            ].map(([lbl, val, col]) => `
+              <div style="background:#0f172a;border:1px solid #1e293b;border-radius:6px;padding:8px;text-align:center">
+                <div style="font-size:10px;color:#475569;margin-bottom:3px">${lbl}</div>
+                <div style="font-size:15px;font-weight:700;color:${col}">${val ?? "—"}</div>
+              </div>`).join("")}
+          </div>
+          <div style="margin-top:8px;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+            <div style="background:#0f172a;border:1px solid #1e293b;border-radius:6px;padding:8px 12px;font-size:13px">
+              <span style="color:#64748b">Option: </span>
+              <span style="color:${sigColor};font-weight:700">${s.optStrike} ${s.optType || ""}</span>
+              <span style="color:#475569;font-size:10px;margin-left:4px">Weekly Expiry</span>
+            </div>
+            <div style="background:#0f172a;border:1px solid #1e293b;border-radius:6px;padding:8px 12px;font-size:12px">
+              <span style="color:#64748b">ATR (15m): </span>
+              <span style="color:#94a3b8;font-weight:600">${s.atr ?? "—"}</span>
+            </div>
+            <div style="background:#0f172a;border:1px solid #1e293b;border-radius:6px;padding:8px 12px;font-size:12px">
+              <span style="color:#64748b">Risk:Reward: </span>
+              <span style="color:#94a3b8;font-weight:600">1 : ${s.atr ? (2).toFixed(1) : "—"} → 1:${s.atr ? (3).toFixed(1) : "—"}</span>
+            </div>
+          </div>
+        </div>` : "";
+
+      const reasonsHtml = [...s.reasons, ...s.cautions].length ? `
+        <div style="margin-top:12px">
+          ${s.reasons.map(r => `<div style="font-size:12px;color:#94a3b8;padding:3px 0;display:flex;gap:6px"><span style="color:#4ade80">→</span>${r}</div>`).join("")}
+          ${s.cautions.map(c => `<div style="font-size:12px;color:#f59e0b;padding:3px 0;display:flex;gap:6px"><span>⚠</span>${c}</div>`).join("")}
+        </div>` : "";
+
+      // Strategy rules reference
+      const rulesHtml = `
+        <details style="margin-top:14px">
+          <summary style="font-size:11px;font-weight:700;color:#475569;letter-spacing:.06em;cursor:pointer;user-select:none">STRATEGY RULES ▾</summary>
+          <div style="margin-top:8px;font-size:11px;color:#64748b;line-height:1.7;background:#0f172a;border-radius:6px;padding:10px 12px;border:1px solid #1e293b">
+            <b style="color:#94a3b8">Entry (BUY CE):</b> EMA9 crosses above EMA21 on 15m + Price > VWAP + RSI 55–75<br>
+            <b style="color:#94a3b8">Entry (BUY PE):</b> EMA9 crosses below EMA21 on 15m + Price &lt; VWAP + RSI 25–45<br>
+            <b style="color:#94a3b8">Strike:</b> ATM (nearest 50), weekly Thursday expiry<br>
+            <b style="color:#94a3b8">Stop Loss:</b> Nifty spot ± 1.5×ATR(14, 15m) from entry<br>
+            <b style="color:#94a3b8">Target 1:</b> ±2×ATR — book 50% here, trail SL to cost<br>
+            <b style="color:#94a3b8">Target 2:</b> ±3×ATR — exit remaining position<br>
+            <b style="color:#94a3b8">Time rules:</b> Skip 9:15–9:30 · No new entries after 2:30 PM · Exit all by 3:15 PM<br>
+            <b style="color:#94a3b8">Max trades:</b> 2 per day · Avoid Thursday afternoon (expiry decay)
+          </div>
+        </details>`;
+
+      box.innerHTML = `
+        <div style="border:1px solid ${sigBorder};border-radius:8px;padding:14px;background:${sigBg};margin-bottom:12px;display:flex;align-items:center;gap:12px">
+          <div style="font-size:28px;font-weight:900;color:${sigColor};line-height:1">${sigIcon}</div>
+          <div>
+            <div style="font-size:20px;font-weight:800;color:${sigColor};letter-spacing:.02em">${s.signal}</div>
+            <div style="font-size:11px;color:#475569;margin-top:2px">Nifty ${s.spot} · VWAP ${s.vwap} · EMA9 ${s.ema9} / EMA21 ${s.ema21} · RSI ${s.rsi} · ${s.barCount} bars</div>
+          </div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:0">${condHtml}</div>
+        ${setupHtml}
+        ${reasonsHtml}
+        ${rulesHtml}`;
     }
 
     async function loadNiftyBacktest() {
