@@ -1266,18 +1266,30 @@ function detectFreshEMACross(data, lookback = 5) {
   };
 
   // Compute label text now so it can be reused in satisfied[] and the return value.
-  const crossDate = hasCross ? (data[len - crossDay]?.date || "") : "";
-  // crossDay=1 → yesterday's candle closed above EMA21 → act Today
-  // crossDay=2 → day-before-yesterday crossed → Yesterday
-  // crossDay=N → (N-1)d ago
+  // When Yahoo has today's live/intraday bar, crossDay=1 used today's price — not a closed bar.
+  // Shift by 1 so the displayed date points to the last CLOSED session (visual cross on chart).
+  const actualToday = new Date().toISOString().slice(0, 10);
+  const lastBarIsToday = len > 0 && data[len - 1]?.date === actualToday;
+  const visualCrossDay = (lastBarIsToday && crossDay === 1) ? 2 : crossDay;
+  const crossDate = hasCross ? (data[len - visualCrossDay]?.date || "") : "";
+  // "Yesterday" means the last CLOSED trading session — could be 1, 2, 3, or 4 cal days ago
+  // (e.g. Mon→Thu via Fri holiday + weekend = 4 days). Anchor to the last closed bar's date.
+  const lastClosedDate = lastBarIsToday ? (data[len - 2]?.date || "") : (data[len - 1]?.date || "");
+  const calDayLabel = (dateStr) => {
+    if (!dateStr) return "—";
+    if (dateStr === actualToday)    return "Today";
+    if (dateStr === lastClosedDate) return "Yesterday";
+    const t = new Date(); t.setHours(0, 0, 0, 0);
+    const d = new Date(dateStr); d.setHours(0, 0, 0, 0);
+    const diff = Math.round((t - d) / 86400000);
+    if (diff <= 3) return "Yesterday"; // also covers normal Fri→Mon 3-day gap
+    return `${diff}d ago`;
+  };
   let crossDayLabel = "—";
   if (nearCross) {
     crossDayLabel = `~Cross (${(gapPct * 100).toFixed(2)}%)`;
   } else if (hasCross) {
-    const daysAgo = crossDay - 1; // 0=Today, 1=Yesterday, 2=2d ago …
-    if      (daysAgo === 0) crossDayLabel = "Today";
-    else if (daysAgo === 1) crossDayLabel = "Yesterday";
-    else                    crossDayLabel = `${daysAgo}d ago`;
+    crossDayLabel = calDayLabel(crossDate);
   }
 
   const satisfied = [];
